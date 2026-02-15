@@ -5,13 +5,14 @@ Creates test images and shows how to store and search memories
 """
 import os
 import sys
+import tempfile
 import requests
 import json
 from PIL import Image, ImageDraw, ImageFont
 from pathlib import Path
 
 BASE_URL = "http://127.0.0.1:8000"
-TEMP_DIR = "/tmp/bepo_examples"
+TEMP_DIR = os.path.join(tempfile.gettempdir(), "bepo_examples")
 
 def create_test_images():
     """Create sample test images"""

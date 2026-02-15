@@ -4,14 +4,12 @@ import io
 import base64
 from datetime import datetime
 from typing import Optional
+from contextlib import asynccontextmanager
 import numpy as np
 from PIL import Image
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import JSONResponse
 import uvicorn
-
-# Initialize FastAPI app
-app = FastAPI(title="Bepo - Memory Storage and Search")
 
 # Database configuration
 DB_PATH = "memories.db"
@@ -28,6 +26,19 @@ try:
     USE_CLIP = True
 except ImportError:
     print("CLIP not available, using fallback embeddings")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifespan context manager for startup and shutdown events"""
+    # Startup
+    init_db()
+    init_model()
+    yield
+    # Shutdown (cleanup if needed)
+    pass
+
+# Initialize FastAPI app with lifespan
+app = FastAPI(title="Bepo - Memory Storage and Search", lifespan=lifespan)
 
 def init_model():
     """Initialize CLIP model for embeddings"""
@@ -191,7 +202,26 @@ def get_text_embedding(text: str) -> np.ndarray:
         return features
 
 def cosine_similarity(vec1: np.ndarray, vec2: np.ndarray) -> float:
-    """Calculate cosine similarity between two vectors"""
+    """
+    Calculate cosine similarity between two vectors.
+    Assumes vectors are already normalized. If not normalized, normalizes them first.
+    
+    Args:
+        vec1: First vector
+        vec2: Second vector
+        
+    Returns:
+        Cosine similarity score between -1 and 1
+    """
+    # Normalize vectors to be defensive
+    norm1 = np.linalg.norm(vec1)
+    norm2 = np.linalg.norm(vec2)
+    
+    if norm1 > 0:
+        vec1 = vec1 / norm1
+    if norm2 > 0:
+        vec2 = vec2 / norm2
+    
     return float(np.dot(vec1, vec2))
 
 def serialize_embedding(embedding: np.ndarray) -> bytes:
@@ -204,13 +234,6 @@ def deserialize_embedding(data: bytes) -> np.ndarray:
     """Deserialize bytes back to numpy array"""
     buffer = io.BytesIO(data)
     return np.load(buffer)
-
-# Initialize on module load (for lifespan)
-@app.on_event("startup")
-async def startup_event():
-    """Initialize database and model on startup"""
-    init_db()
-    init_model()
 
 @app.post("/memory")
 async def create_memory(
