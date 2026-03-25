@@ -23,6 +23,7 @@ processor = None
 try:
     from transformers import CLIPProcessor, CLIPModel
     import torch
+    import torch.nn.functional as F
     USE_CLIP = True
 except ImportError:
     print("CLIP not available, using fallback embeddings")
@@ -89,7 +90,7 @@ def get_image_embedding(image: Image.Image) -> np.ndarray:
         with torch.no_grad():
             image_features = model.get_image_features(**inputs)
         # Normalize the embedding
-        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+        image_features = F.normalize(image_features, dim=-1)
         return image_features.cpu().numpy().flatten()
     else:
         # Fallback: Use simple image features (color histogram + basic stats)
@@ -156,7 +157,7 @@ def get_text_embedding(text: str) -> np.ndarray:
         with torch.no_grad():
             text_features = model.get_text_features(**inputs)
         # Normalize the embedding
-        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+        text_features = F.normalize(text_features, dim=-1)
         return text_features.cpu().numpy().flatten()
     else:
         # Fallback: Simple text embedding - Fixed 128 dimensions
