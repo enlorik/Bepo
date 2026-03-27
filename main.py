@@ -89,6 +89,12 @@ def get_image_embedding(image: Image.Image) -> np.ndarray:
         inputs = processor(images=image, return_tensors="pt")
         with torch.no_grad():
             image_features = model.get_image_features(**inputs)
+        # get_image_features should return a tensor, but defensively handle
+        # cases where some transformers versions return a model output object
+        if hasattr(image_features, 'pooler_output'):
+            image_features = image_features.pooler_output
+        elif hasattr(image_features, 'last_hidden_state'):
+            image_features = image_features.last_hidden_state[:, 0, :]
         # Normalize the embedding
         image_features = F.normalize(image_features, dim=-1)
         return image_features.cpu().numpy().flatten()
@@ -156,6 +162,12 @@ def get_text_embedding(text: str) -> np.ndarray:
         inputs = processor(text=[text], return_tensors="pt", padding=True)
         with torch.no_grad():
             text_features = model.get_text_features(**inputs)
+        # get_text_features should return a tensor, but defensively handle
+        # cases where some transformers versions return a model output object
+        if hasattr(text_features, 'pooler_output'):
+            text_features = text_features.pooler_output
+        elif hasattr(text_features, 'last_hidden_state'):
+            text_features = text_features.last_hidden_state[:, 0, :]
         # Normalize the embedding
         text_features = F.normalize(text_features, dim=-1)
         return text_features.cpu().numpy().flatten()
