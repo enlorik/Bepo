@@ -4,6 +4,6 @@ python-multipart
 pillow
 torch
 torchvision
-transformers
+transformers>=4.30.0,<5.0.0
 numpy
 requests
