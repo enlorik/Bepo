@@ -517,8 +517,14 @@ class BepoApp:
     def _search_done(self, result: dict):
         _text_set(self._search_response, _pretty_json(result))
 
-        if result.get("status") == "success" and "match" in result:
+        # Resolve the best match from either response format.
+        match = None
+        if result.get("matches"):
+            match = result["matches"][0]
+        elif "match" in result:
             match = result["match"]
+
+        if result.get("status") == "success" and match is not None:
             note_text = match.get("note") or "(no note)"
             score = match.get("score", 0)
             ts = match.get("timestamp", "")
@@ -531,9 +537,9 @@ class BepoApp:
                 meta_parts.append(f"({lat}, {lon})")
             self._res_meta.config(text="  ·  ".join(meta_parts))
 
-            # thumbnail from local image_path
+            # thumbnail — prefer local image_path; skip gracefully if unavailable
             img_path = match.get("image_path", "")
-            thumb = _make_thumb(img_path)
+            thumb = _make_thumb(img_path) if img_path else None
             if thumb:
                 self._search_thumb = thumb
                 self._search_thumb_label.config(image=thumb)
