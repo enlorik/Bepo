@@ -1,14 +1,13 @@
 import os
 import sqlite3
 import io
-import base64
 from datetime import datetime
 from typing import Optional
 from contextlib import asynccontextmanager
 import numpy as np
 from PIL import Image
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse
 import uvicorn
 
 # Database configuration
@@ -214,27 +213,71 @@ def get_text_embedding(text: str) -> np.ndarray:
         
         return features
 
+def get_db_connection() -> sqlite3.Connection:
+    """Open a SQLite connection with row_factory set to Row."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def build_map_url(lat, lon) -> Optional[str]:
+    """Return a Google Maps URL when both lat and lon are present, else None."""
+    if lat is not None and lon is not None:
+        return f"https://www.google.com/maps/search/?api=1&query={lat},{lon}"
+    return None
+
+
+def build_image_url(memory_id: int) -> str:
+    """Return the relative URL used to serve an image for a given memory id."""
+    return f"/image/{memory_id}"
+
+
+def row_to_memory_response(row: sqlite3.Row) -> dict:
+    """Convert a database row to the standard memory response dict (no embeddings)."""
+    memory_id = row["id"]
+    lat = row["lat"]
+    lon = row["lon"]
+    return {
+        "id": memory_id,
+        "timestamp": row["ts"],
+        "note": row["text_note"],
+        "lat": lat,
+        "lon": lon,
+        "image_path": row["image_path"],
+        "image_url": build_image_url(memory_id),
+        "map_url": build_map_url(lat, lon),
+    }
+
+
+def fetch_memory_by_id(memory_id: int) -> Optional[sqlite3.Row]:
+    """Return the database row for *memory_id*, or None if not found."""
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT id, ts, lat, lon, image_path, image_emb, text_note, text_emb "
+            "FROM memories WHERE id = ?",
+            (memory_id,),
+        )
+        return cursor.fetchone()
+    finally:
+        conn.close()
+
+
 def cosine_similarity(vec1: np.ndarray, vec2: np.ndarray) -> float:
     """
     Calculate cosine similarity between two vectors.
     Assumes vectors are already normalized. If not normalized, normalizes them first.
-    
-    Args:
-        vec1: First vector
-        vec2: Second vector
-        
-    Returns:
-        Cosine similarity score between -1 and 1
     """
     # Normalize vectors to be defensive
     norm1 = np.linalg.norm(vec1)
     norm2 = np.linalg.norm(vec2)
-    
+
     if norm1 > 0:
         vec1 = vec1 / norm1
     if norm2 > 0:
         vec2 = vec2 / norm2
-    
+
     return float(np.dot(vec1, vec2))
 
 def serialize_embedding(embedding: np.ndarray) -> bytes:
@@ -283,25 +326,25 @@ async def create_memory(
             text_emb = get_text_embedding(note)
         
         # Store in database
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        
-        cursor.execute("""
-            INSERT INTO memories (ts, lat, lon, image_path, image_emb, text_note, text_emb)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (
-            timestamp.isoformat(),
-            lat,
-            lon,
-            image_path,
-            serialize_embedding(image_emb),
-            note,
-            serialize_embedding(text_emb) if text_emb is not None else None
-        ))
-        
-        memory_id = cursor.lastrowid
-        conn.commit()
-        conn.close()
+        conn = get_db_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO memories (ts, lat, lon, image_path, image_emb, text_note, text_emb)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (
+                timestamp.isoformat(),
+                lat,
+                lon,
+                image_path,
+                serialize_embedding(image_emb),
+                note,
+                serialize_embedding(text_emb) if text_emb is not None else None
+            ))
+            memory_id = cursor.lastrowid
+            conn.commit()
+        finally:
+            conn.close()
         
         return {
             "status": "success",
@@ -317,85 +360,150 @@ async def create_memory(
         raise HTTPException(status_code=500, detail=f"Error creating memory: {str(e)}")
 
 @app.post("/search")
-async def search_memories(query: str = Form(...)):
+async def search_memories(
+    query: str = Form(...),
+    top_k: int = Form(5),
+):
     """
     Search memories by text query.
-    Returns the top matching memory based on cosine similarity of embeddings.
+    Returns up to *top_k* matches sorted by score descending.
     """
+    # Validate inputs
+    if not query or not query.strip():
+        raise HTTPException(status_code=422, detail="query must not be empty or whitespace")
+    if not (1 <= top_k <= 20):
+        raise HTTPException(status_code=422, detail="top_k must be between 1 and 20")
+
     try:
         # Generate query embedding
         query_emb = get_text_embedding(query)
-        
+
         # Retrieve all memories with embeddings
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        
-        cursor.execute("""
-            SELECT id, ts, lat, lon, image_path, image_emb, text_note, text_emb
-            FROM memories
-        """)
-        
-        rows = cursor.fetchall()
-        conn.close()
-        
+        conn = get_db_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT id, ts, lat, lon, image_path, image_emb, text_note, text_emb "
+                "FROM memories"
+            )
+            rows = cursor.fetchall()
+        finally:
+            conn.close()
+
         if not rows:
             return {
                 "status": "no_results",
-                "message": "No memories found in database"
+                "message": "No memories found in database",
+                "matches": [],
             }
-        
-        # Calculate similarities
-        best_match = None
-        best_score = -1
-        
+
+        # Score every memory
+        scored = []
         for row in rows:
-            memory_id, ts, lat, lon, image_path, image_emb_blob, text_note, text_emb_blob = row
-            
-            # Deserialize embeddings
-            image_emb = deserialize_embedding(image_emb_blob)
-            
-            # Calculate similarity with image embedding
+            image_emb = deserialize_embedding(row["image_emb"])
             image_score = cosine_similarity(query_emb, image_emb)
-            
-            # If text embedding exists, also calculate text similarity and use the better one
-            text_score = -1
-            if text_emb_blob:
-                text_emb = deserialize_embedding(text_emb_blob)
+
+            text_score = -1.0
+            if row["text_emb"] is not None:
+                text_emb = deserialize_embedding(row["text_emb"])
                 text_score = cosine_similarity(query_emb, text_emb)
-            
-            # Use the maximum similarity score
+
             score = max(image_score, text_score)
-            
-            if score > best_score:
-                best_score = score
-                best_match = {
-                    "id": memory_id,
-                    "timestamp": ts,
-                    "image_path": image_path,
-                    "note": text_note,
-                    "lat": lat,
-                    "lon": lon,
-                    "score": score
-                }
-        
+            memory_id = row["id"]
+            lat = row["lat"]
+            lon = row["lon"]
+            scored.append({
+                "id": memory_id,
+                "timestamp": row["ts"],
+                "image_path": row["image_path"],
+                "image_url": build_image_url(memory_id),
+                "note": row["text_note"],
+                "lat": lat,
+                "lon": lon,
+                "map_url": build_map_url(lat, lon),
+                "score": score,
+            })
+
+        # Sort by score descending and take top_k
+        scored.sort(key=lambda x: x["score"], reverse=True)
+        matches = scored[:top_k]
+
         return {
             "status": "success",
-            "match": best_match
+            "query": query,
+            "count": len(matches),
+            "matches": matches,
         }
-        
+
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error searching memories: {str(e)}")
+
+
+@app.get("/memories")
+async def list_memories():
+    """Return all saved memories, newest first. Embeddings are not included."""
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT id, ts, lat, lon, image_path, text_note "
+            "FROM memories ORDER BY ts DESC"
+        )
+        rows = cursor.fetchall()
+    finally:
+        conn.close()
+
+    return [
+        {
+            "id": row["id"],
+            "timestamp": row["ts"],
+            "note": row["text_note"],
+            "lat": row["lat"],
+            "lon": row["lon"],
+            "image_path": row["image_path"],
+            "image_url": build_image_url(row["id"]),
+            "map_url": build_map_url(row["lat"], row["lon"]),
+        }
+        for row in rows
+    ]
+
+
+@app.get("/memory/{memory_id}")
+async def get_memory(memory_id: int):
+    """Return a single memory by id. Returns 404 if not found."""
+    row = fetch_memory_by_id(memory_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"Memory {memory_id} not found")
+    return row_to_memory_response(row)
+
+
+@app.get("/image/{memory_id}")
+async def get_image(memory_id: int):
+    """Serve the image file associated with a memory. Returns 404 if not found."""
+    row = fetch_memory_by_id(memory_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"Memory {memory_id} not found")
+    image_path = row["image_path"]
+    if not os.path.isfile(image_path):
+        raise HTTPException(status_code=404, detail=f"Image file not found for memory {memory_id}")
+    return FileResponse(image_path)
 
 @app.get("/")
 async def root():
     """Root endpoint with API information"""
     return {
         "app": "Bepo",
+        "version": "0.2",
         "description": "Memory storage and search with image and text embeddings",
         "endpoints": {
-            "/memory": "POST - Store a new memory with photo, note, and GPS",
-            "/search": "POST - Search memories by text query"
-        }
+            "POST /memory": "Store a new memory with photo, note, and GPS",
+            "GET /memories": "List all memories, newest first",
+            "GET /memory/{id}": "Get a single memory by id",
+            "GET /image/{id}": "Serve the image for a memory",
+            "POST /search": "Search memories by text query (supports top_k parameter)",
+        },
     }
 
 if __name__ == "__main__":
