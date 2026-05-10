@@ -6,6 +6,7 @@ replacing init_model with a no-op so no network calls are made.
 All tests use a temporary SQLite database via a fixture that patches DB_PATH.
 """
 import io
+import sqlite3
 import pytest
 import main as app_module
 from fastapi.testclient import TestClient
@@ -84,6 +85,31 @@ class TestListMemories:
         assert "image_url" in m
         assert "image_emb" not in m
         assert "text_emb" not in m
+        assert "user_note" in m
+        assert "bepo_summary" in m
+        assert "tags" in m
+        assert "mood" in m
+        assert "place_hint" in m
+
+    def test_old_minimal_post_memory_still_works(self, client):
+        r = client.post(
+            "/memory",
+            files={"photo": ("img.jpg", _tiny_jpeg(), "image/jpeg")},
+            data={"note": "minimal"},
+        )
+        assert r.status_code == 200
+        data = r.json()
+        assert data["status"] == "success"
+        memory_id = data["memory_id"]
+
+        get_r = client.get(f"/memory/{memory_id}")
+        assert get_r.status_code == 200
+        memory = get_r.json()
+        assert memory["note"] == "minimal"
+        assert memory["user_note"] is None
+        assert memory["mood"] is None
+        assert memory["tags"] is None
+        assert memory["place_hint"] is None
 
 
 class TestGetMemory:
@@ -107,6 +133,35 @@ class TestGetMemory:
         assert data["lon"] == pytest.approx(4.56)
         assert "image_emb" not in data
         assert "text_emb" not in data
+        assert data["user_note"] is None
+        assert data["bepo_summary"] is None
+        assert data["tags"] is None
+        assert data["mood"] is None
+        assert data["place_hint"] is None
+
+    def test_returns_new_metadata_fields(self, client):
+        resp = client.post(
+            "/memory",
+            files={"photo": ("img.jpg", _tiny_jpeg(), "image/jpeg")},
+            data={
+                "note": "cafe",
+                "user_note": "cat on chair",
+                "bepo_summary": "quiet cat cafe",
+                "tags": "cafe,cat,cozy",
+                "mood": "calm",
+                "place_hint": "near red couch",
+            },
+        )
+        memory_id = resp.json()["memory_id"]
+        r = client.get(f"/memory/{memory_id}")
+        assert r.status_code == 200
+        data = r.json()
+        assert data["note"] == "cafe"
+        assert data["user_note"] == "cat on chair"
+        assert data["bepo_summary"] == "quiet cat cafe"
+        assert data["tags"] == "cafe,cat,cozy"
+        assert data["mood"] == "calm"
+        assert data["place_hint"] == "near red couch"
 
 
 class TestGetImage:
@@ -147,6 +202,51 @@ class TestSearch:
         assert "id" in match
         assert "score" in match
         assert "image_url" in match
+        assert "user_note" in match
+        assert "bepo_summary" in match
+        assert "tags" in match
+        assert "mood" in match
+        assert "place_hint" in match
+
+    def test_post_with_mood_tags_place_hint_works(self, client):
+        r = client.post(
+            "/memory",
+            files={"photo": ("img.jpg", _tiny_jpeg(), "image/jpeg")},
+            data={
+                "mood": "calm",
+                "tags": "cat,cafe",
+                "place_hint": "near the red couch hallway",
+            },
+        )
+        assert r.status_code == 200
+        memory_id = r.json()["memory_id"]
+
+        get_r = client.get(f"/memory/{memory_id}")
+        assert get_r.status_code == 200
+        memory = get_r.json()
+        assert memory["mood"] == "calm"
+        assert memory["tags"] == "cat,cafe"
+        assert memory["place_hint"] == "near the red couch hallway"
+
+    def test_search_finds_memory_from_richer_metadata(self, client):
+        client.post(
+            "/memory",
+            files={"photo": ("img.jpg", _tiny_jpeg(), "image/jpeg")},
+            data={
+                "user_note": "cat sleeping by the window",
+                "bepo_summary": "cozy cafe",
+                "tags": "cute barista place",
+                "mood": "calm",
+                "place_hint": "that weird hallway near the red couch",
+            },
+        )
+        r = client.post("/search", data={"query": "red couch hallway", "top_k": "3"})
+        assert r.status_code == 200
+        data = r.json()
+        assert data["status"] == "success"
+        assert data["count"] >= 1
+        top = data["matches"][0]
+        assert top["place_hint"] == "that weird hallway near the red couch"
 
     def test_empty_query_rejected(self, client):
         r = client.post("/search", data={"query": "   "})
@@ -175,3 +275,49 @@ class TestBuildMapUrl:
 
     def test_returns_none_when_both_missing(self):
         assert app_module.build_map_url(None, None) is None
+
+
+class TestInitDbMigration:
+    def test_init_db_adds_missing_columns_without_data_loss(self, tmp_path, monkeypatch):
+        old_db_path = str(tmp_path / "legacy_memories.db")
+        old_images_dir = str(tmp_path / "legacy_images")
+        monkeypatch.setattr(app_module, "DB_PATH", old_db_path)
+        monkeypatch.setattr(app_module, "IMAGES_DIR", old_images_dir)
+
+        conn = sqlite3.connect(old_db_path)
+        try:
+            cursor = conn.cursor()
+            cursor.execute("""
+                CREATE TABLE memories (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts DATETIME NOT NULL,
+                    lat REAL,
+                    lon REAL,
+                    image_path TEXT NOT NULL,
+                    image_emb BLOB NOT NULL,
+                    text_note TEXT,
+                    text_emb BLOB
+                )
+            """)
+            cursor.execute("""
+                INSERT INTO memories (ts, lat, lon, image_path, image_emb, text_note, text_emb)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, ("2026-01-01T00:00:00", 1.0, 2.0, "images/legacy.jpg", b"img", "legacy note", b"text"))
+            conn.commit()
+        finally:
+            conn.close()
+
+        app_module.init_db()
+
+        conn2 = sqlite3.connect(old_db_path)
+        try:
+            cursor2 = conn2.cursor()
+            cursor2.execute("PRAGMA table_info(memories)")
+            columns = {row[1] for row in cursor2.fetchall()}
+            assert {"user_note", "bepo_summary", "tags", "mood", "place_hint"}.issubset(columns)
+
+            cursor2.execute("SELECT text_note, lat, lon FROM memories")
+            row = cursor2.fetchone()
+            assert row == ("legacy note", 1.0, 2.0)
+        finally:
+            conn2.close()
