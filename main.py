@@ -81,16 +81,16 @@ def init_db():
     # Migration-safe schema updates for existing databases.
     cursor.execute("PRAGMA table_info(memories)")
     existing_columns = {row[1] for row in cursor.fetchall()}
-    required_text_columns = {
-        "user_note",
-        "bepo_summary",
-        "tags",
-        "mood",
-        "place_hint",
+    migration_alter_statements = {
+        "user_note": "ALTER TABLE memories ADD COLUMN user_note TEXT",
+        "bepo_summary": "ALTER TABLE memories ADD COLUMN bepo_summary TEXT",
+        "tags": "ALTER TABLE memories ADD COLUMN tags TEXT",
+        "mood": "ALTER TABLE memories ADD COLUMN mood TEXT",
+        "place_hint": "ALTER TABLE memories ADD COLUMN place_hint TEXT",
     }
-    for column in required_text_columns:
+    for column, statement in migration_alter_statements.items():
         if column not in existing_columns:
-            cursor.execute(f"ALTER TABLE memories ADD COLUMN {column} TEXT")
+            cursor.execute(statement)
     
     conn.commit()
     conn.close()
