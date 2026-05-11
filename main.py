@@ -288,10 +288,12 @@ def row_to_memory_response(row: sqlite3.Row) -> dict:
 
 
 def metadata_payload_to_updates(payload: MemoryMetadataUpdate) -> dict:
-    """Return only explicitly provided metadata fields mapped to DB column names."""
-    provided_fields = getattr(payload, "model_fields_set", None)
-    if provided_fields is None:
-        provided_fields = payload.__fields_set__
+    """Return explicitly set editable fields, mapping API `note` to DB `text_note`."""
+    dump_method = getattr(payload, "model_dump", None)
+    if dump_method is None:
+        provided_fields = payload.dict(exclude_unset=True).keys()
+    else:
+        provided_fields = dump_method(exclude_unset=True).keys()
     return {
         "text_note" if field == "note" else field: getattr(payload, field)
         for field in METADATA_FIELDS
