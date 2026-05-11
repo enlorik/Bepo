@@ -7,6 +7,7 @@ All tests use a temporary SQLite database via a fixture that patches DB_PATH.
 """
 import io
 import sqlite3
+import numpy as np
 import pytest
 import main as app_module
 from fastapi.testclient import TestClient
@@ -49,6 +50,21 @@ def _tiny_jpeg() -> bytes:
     buf = io.BytesIO()
     img.save(buf, format="JPEG")
     return buf.getvalue()
+
+
+def _fetch_memory_row(memory_id: int):
+    conn = sqlite3.connect(app_module.DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT id, text_note, user_note, bepo_summary, tags, mood, place_hint, text_emb "
+            "FROM memories WHERE id = ?",
+            (memory_id,),
+        )
+        return cursor.fetchone()
+    finally:
+        conn.close()
 
 
 # ── tests ──────────────────────────────────────────────────────────────────
@@ -177,6 +193,188 @@ class TestGetImage:
         memory_id = resp.json()["memory_id"]
         r = client.get(f"/image/{memory_id}")
         assert r.status_code == 200
+
+
+class TestPatchMemoryMetadata:
+    def test_updates_selected_metadata_fields(self, client):
+        create_r = client.post(
+            "/memory",
+            files={"photo": ("img.jpg", _tiny_jpeg(), "image/jpeg")},
+            data={"note": "original note", "bepo_summary": "keep summary"},
+        )
+        memory_id = create_r.json()["memory_id"]
+
+        patch_r = client.patch(
+            f"/memory/{memory_id}/metadata",
+            json={
+                "user_note": "new user note",
+                "mood": "excited",
+                "tags": "park,dog",
+                "place_hint": "near the fountain",
+            },
+        )
+
+        assert patch_r.status_code == 200
+        data = patch_r.json()
+        assert data["id"] == memory_id
+        assert data["note"] == "original note"
+        assert data["user_note"] == "new user note"
+        assert data["bepo_summary"] == "keep summary"
+        assert data["tags"] == "park,dog"
+        assert data["mood"] == "excited"
+        assert data["place_hint"] == "near the fountain"
+        assert "text_emb" not in data
+        assert "image_emb" not in data
+
+    def test_omitted_fields_preserve_existing_values(self, client):
+        create_r = client.post(
+            "/memory",
+            files={"photo": ("img.jpg", _tiny_jpeg(), "image/jpeg")},
+            data={
+                "note": "original note",
+                "user_note": "original user note",
+                "bepo_summary": "original summary",
+                "tags": "old,tags",
+                "mood": "calm",
+                "place_hint": "old place",
+            },
+        )
+        memory_id = create_r.json()["memory_id"]
+
+        patch_r = client.patch(
+            f"/memory/{memory_id}/metadata",
+            json={"mood": "joyful"},
+        )
+
+        assert patch_r.status_code == 200
+        data = patch_r.json()
+        assert data["note"] == "original note"
+        assert data["user_note"] == "original user note"
+        assert data["bepo_summary"] == "original summary"
+        assert data["tags"] == "old,tags"
+        assert data["mood"] == "joyful"
+        assert data["place_hint"] == "old place"
+
+    def test_null_clears_a_field(self, client):
+        create_r = client.post(
+            "/memory",
+            files={"photo": ("img.jpg", _tiny_jpeg(), "image/jpeg")},
+            data={"note": "note", "mood": "calm"},
+        )
+        memory_id = create_r.json()["memory_id"]
+
+        patch_r = client.patch(
+            f"/memory/{memory_id}/metadata",
+            json={"mood": None},
+        )
+
+        assert patch_r.status_code == 200
+        assert patch_r.json()["mood"] is None
+
+    def test_text_embedding_is_recomputed_after_update(self, client):
+        create_r = client.post(
+            "/memory",
+            files={"photo": ("img.jpg", _tiny_jpeg(), "image/jpeg")},
+            data={"note": "first note"},
+        )
+        memory_id = create_r.json()["memory_id"]
+        before_row = _fetch_memory_row(memory_id)
+        before_emb = app_module.deserialize_embedding(before_row["text_emb"])
+
+        patch_r = client.patch(
+            f"/memory/{memory_id}/metadata",
+            json={"user_note": "updated metadata"},
+        )
+
+        assert patch_r.status_code == 200
+        after_row = _fetch_memory_row(memory_id)
+        after_emb = app_module.deserialize_embedding(after_row["text_emb"])
+        expected_emb = app_module.get_text_embedding("first note\nupdated metadata")
+
+        assert not np.allclose(before_emb, after_emb)
+        assert np.allclose(after_emb, expected_emb)
+
+    def test_clearing_all_text_fields_sets_text_embedding_to_null(self, client):
+        create_r = client.post(
+            "/memory",
+            files={"photo": ("img.jpg", _tiny_jpeg(), "image/jpeg")},
+            data={
+                "note": "note",
+                "user_note": "user",
+                "bepo_summary": "summary",
+                "tags": "tag1,tag2",
+                "mood": "happy",
+                "place_hint": "somewhere",
+            },
+        )
+        memory_id = create_r.json()["memory_id"]
+
+        patch_r = client.patch(
+            f"/memory/{memory_id}/metadata",
+            json={
+                "note": None,
+                "user_note": None,
+                "bepo_summary": None,
+                "tags": None,
+                "mood": None,
+                "place_hint": None,
+            },
+        )
+
+        assert patch_r.status_code == 200
+        row = _fetch_memory_row(memory_id)
+        assert row["text_note"] is None
+        assert row["user_note"] is None
+        assert row["bepo_summary"] is None
+        assert row["tags"] is None
+        assert row["mood"] is None
+        assert row["place_hint"] is None
+        assert row["text_emb"] is None
+
+    def test_missing_memory_returns_404(self, client):
+        patch_r = client.patch("/memory/9999/metadata", json={"mood": "calm"})
+        assert patch_r.status_code == 404
+
+    def test_updated_metadata_appears_in_get_memory(self, client):
+        create_r = client.post(
+            "/memory",
+            files={"photo": ("img.jpg", _tiny_jpeg(), "image/jpeg")},
+            data={"note": "old note"},
+        )
+        memory_id = create_r.json()["memory_id"]
+
+        client.patch(
+            f"/memory/{memory_id}/metadata",
+            json={"user_note": "fresh detail", "place_hint": "library stairs"},
+        )
+
+        get_r = client.get(f"/memory/{memory_id}")
+        assert get_r.status_code == 200
+        data = get_r.json()
+        assert data["user_note"] == "fresh detail"
+        assert data["place_hint"] == "library stairs"
+
+    def test_search_finds_memory_using_new_metadata_after_patch(self, client):
+        create_r = client.post(
+            "/memory",
+            files={"photo": ("img.jpg", _tiny_jpeg(), "image/jpeg")},
+            data={"note": "plain photo"},
+        )
+        memory_id = create_r.json()["memory_id"]
+
+        patch_r = client.patch(
+            f"/memory/{memory_id}/metadata",
+            json={"place_hint": "purple bicycle rack"},
+        )
+        assert patch_r.status_code == 200
+
+        search_r = client.post("/search", data={"query": "purple bicycle rack", "top_k": "3"})
+        assert search_r.status_code == 200
+        data = search_r.json()
+        assert data["status"] == "success"
+        assert data["count"] >= 1
+        assert data["matches"][0]["id"] == memory_id
+        assert data["matches"][0]["place_hint"] == "purple bicycle rack"
 
 
 class TestSearch:
