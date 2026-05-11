@@ -1,10 +1,10 @@
 # Bepo
 
-A local Python FastAPI application for storing and searching memories with images, text notes, and GPS coordinates using CLIP embeddings.
+A local Python FastAPI application for storing and searching memories with images, text notes, richer memory metadata, and GPS coordinates using CLIP embeddings.
 
 ## Features
 
-- **Store Memories**: Upload photos with optional text notes and GPS coordinates
+- **Store Memories**: Upload photos with optional notes, richer metadata, and GPS coordinates
 - **List & Retrieve Memories**: Browse all memories or fetch a single one by id
 - **Serve Images**: Dedicated endpoint for serving stored image files
 - **Semantic Search**: Search memories using natural language queries with configurable result count
@@ -33,11 +33,16 @@ The API will be available at `http://127.0.0.1:8000`
 
 ### POST /memory
 
-Store a new memory with a photo, optional text note, and GPS coordinates.
+Store a new memory with a photo, optional text note/metadata, and GPS coordinates.
 
 **Parameters:**
 - `photo` (file, required): Image file to upload
 - `note` (string, optional): Text note describing the memory
+- `user_note` (string, optional): What the user noticed/felt in their own words
+- `bepo_summary` (string, optional): Optional concise assistant-style summary of the memory
+- `tags` (string, optional): Comma-separated or free-form tags
+- `mood` (string, optional): Mood/emotion hint (for example `calm`, `excited`)
+- `place_hint` (string, optional): Optional place cue (for example `near red couch hallway`)
 - `lat` (float, optional): Latitude coordinate
 - `lon` (float, optional): Longitude coordinate
 
@@ -46,6 +51,8 @@ Store a new memory with a photo, optional text note, and GPS coordinates.
 curl -X POST "http://127.0.0.1:8000/memory" \
   -F "photo=@path/to/image.jpg" \
   -F "note=Beautiful sunset at the beach" \
+  -F "mood=calm" \
+  -F "tags=beach,sunset" \
   -F "lat=34.0522" \
   -F "lon=-118.2437"
 ```
@@ -57,9 +64,16 @@ curl -X POST "http://127.0.0.1:8000/memory" \
   "memory_id": 1,
   "timestamp": "2024-01-01T12:00:00.000000",
   "image_path": "images/20240101_120000_000000.jpg",
+  "image_url": "/image/1",
   "note": "Beautiful sunset at the beach",
+  "user_note": null,
+  "bepo_summary": null,
+  "tags": "beach,sunset",
+  "mood": "calm",
+  "place_hint": null,
   "lat": 34.0522,
-  "lon": -118.2437
+  "lon": -118.2437,
+  "map_url": "https://www.google.com/maps/search/?api=1&query=34.0522,-118.2437"
 }
 ```
 
@@ -68,6 +82,7 @@ curl -X POST "http://127.0.0.1:8000/memory" \
 ### GET /memories
 
 Return all saved memories, newest first. Embeddings are not included.
+Includes `note`, `user_note`, `bepo_summary`, `tags`, `mood`, `place_hint`, `lat`, `lon`, `map_url`, and `image_url`.
 
 **Example:**
 ```bash
@@ -95,6 +110,7 @@ curl "http://127.0.0.1:8000/memories"
 ### GET /memory/{id}
 
 Return a single memory by id. Returns 404 if not found.
+Includes `note`, `user_note`, `bepo_summary`, `tags`, `mood`, `place_hint`, `lat`, `lon`, `map_url`, and `image_url`.
 
 **Example:**
 ```bash
@@ -157,6 +173,11 @@ curl -X POST "http://127.0.0.1:8000/search" \
       "image_path": "images/20240101_120000_000000.jpg",
       "image_url": "/image/1",
       "note": "Beautiful sunset at the beach",
+      "user_note": null,
+      "bepo_summary": null,
+      "tags": "beach,sunset",
+      "mood": "calm",
+      "place_hint": null,
       "lat": 34.0522,
       "lon": -118.2437,
       "map_url": "https://www.google.com/maps/search/?api=1&query=34.0522,-118.2437",
@@ -201,9 +222,18 @@ CREATE TABLE memories (
     image_path TEXT NOT NULL,
     image_emb BLOB NOT NULL,
     text_note TEXT,
-    text_emb BLOB
+    text_emb BLOB,
+    user_note TEXT,
+    bepo_summary TEXT,
+    tags TEXT,
+    mood TEXT,
+    place_hint TEXT
 );
 ```
+
+`text_note` is kept for backward compatibility. On startup, Bepo runs a migration-safe schema check (`PRAGMA table_info(memories)` + `ALTER TABLE ... ADD COLUMN`) so existing `memories.db` files are upgraded in place without dropping data.
+
+For semantic search, Bepo builds text embeddings from all available memory text fields (`note`, `user_note`, `bepo_summary`, `tags`, `mood`, `place_hint`). These richer fields are intended for future Bepo chat and personal recall features.
 
 ## Architecture
 

@@ -77,6 +77,20 @@ def init_db():
             text_emb BLOB
         )
     """)
+
+    # Migration-safe schema updates for existing databases.
+    cursor.execute("PRAGMA table_info(memories)")
+    existing_columns = {row[1] for row in cursor.fetchall()}
+    migration_alter_statements = {
+        "user_note": "ALTER TABLE memories ADD COLUMN user_note TEXT",
+        "bepo_summary": "ALTER TABLE memories ADD COLUMN bepo_summary TEXT",
+        "tags": "ALTER TABLE memories ADD COLUMN tags TEXT",
+        "mood": "ALTER TABLE memories ADD COLUMN mood TEXT",
+        "place_hint": "ALTER TABLE memories ADD COLUMN place_hint TEXT",
+    }
+    for column, statement in migration_alter_statements.items():
+        if column not in existing_columns:
+            cursor.execute(statement)
     
     conn.commit()
     conn.close()
@@ -241,6 +255,11 @@ def row_to_memory_response(row: sqlite3.Row) -> dict:
         "id": memory_id,
         "timestamp": row["ts"],
         "note": row["text_note"],
+        "user_note": row["user_note"],
+        "bepo_summary": row["bepo_summary"],
+        "tags": row["tags"],
+        "mood": row["mood"],
+        "place_hint": row["place_hint"],
         "lat": lat,
         "lon": lon,
         "image_path": row["image_path"],
@@ -255,13 +274,22 @@ def fetch_memory_by_id(memory_id: int) -> Optional[sqlite3.Row]:
     try:
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT id, ts, lat, lon, image_path, image_emb, text_note, text_emb "
+            "SELECT id, ts, lat, lon, image_path, image_emb, text_note, text_emb, "
+            "user_note, bepo_summary, tags, mood, place_hint "
             "FROM memories WHERE id = ?",
             (memory_id,),
         )
         return cursor.fetchone()
     finally:
         conn.close()
+
+
+def build_combined_text(*fields: Optional[str]) -> Optional[str]:
+    """Combine non-empty text fields for text embedding generation."""
+    parts = [field.strip() for field in fields if field is not None and field.strip()]
+    if not parts:
+        return None
+    return "\n".join(parts)
 
 
 def cosine_similarity(vec1: np.ndarray, vec2: np.ndarray) -> float:
@@ -295,6 +323,11 @@ def deserialize_embedding(data: bytes) -> np.ndarray:
 async def create_memory(
     photo: UploadFile = File(...),
     note: Optional[str] = Form(None),
+    user_note: Optional[str] = Form(None),
+    bepo_summary: Optional[str] = Form(None),
+    tags: Optional[str] = Form(None),
+    mood: Optional[str] = Form(None),
+    place_hint: Optional[str] = Form(None),
     lat: Optional[float] = Form(None),
     lon: Optional[float] = Form(None)
 ):
@@ -322,16 +355,20 @@ async def create_memory(
         # Generate embeddings
         image_emb = get_image_embedding(image)
         text_emb = None
-        if note:
-            text_emb = get_text_embedding(note)
+        combined_text = build_combined_text(note, user_note, bepo_summary, tags, mood, place_hint)
+        if combined_text is not None:
+            text_emb = get_text_embedding(combined_text)
         
         # Store in database
         conn = get_db_connection()
         try:
             cursor = conn.cursor()
             cursor.execute("""
-                INSERT INTO memories (ts, lat, lon, image_path, image_emb, text_note, text_emb)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO memories (
+                    ts, lat, lon, image_path, image_emb, text_note, text_emb,
+                    user_note, bepo_summary, tags, mood, place_hint
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 timestamp.isoformat(),
                 lat,
@@ -339,7 +376,12 @@ async def create_memory(
                 image_path,
                 serialize_embedding(image_emb),
                 note,
-                serialize_embedding(text_emb) if text_emb is not None else None
+                serialize_embedding(text_emb) if text_emb is not None else None,
+                user_note,
+                bepo_summary,
+                tags,
+                mood,
+                place_hint,
             ))
             memory_id = cursor.lastrowid
             conn.commit()
@@ -351,9 +393,16 @@ async def create_memory(
             "memory_id": memory_id,
             "timestamp": timestamp.isoformat(),
             "image_path": image_path,
+            "image_url": build_image_url(memory_id),
             "note": note,
+            "user_note": user_note,
+            "bepo_summary": bepo_summary,
+            "tags": tags,
+            "mood": mood,
+            "place_hint": place_hint,
             "lat": lat,
-            "lon": lon
+            "lon": lon,
+            "map_url": build_map_url(lat, lon),
         }
         
     except Exception as e:
@@ -383,7 +432,8 @@ async def search_memories(
         try:
             cursor = conn.cursor()
             cursor.execute(
-                "SELECT id, ts, lat, lon, image_path, image_emb, text_note, text_emb "
+                "SELECT id, ts, lat, lon, image_path, image_emb, text_note, text_emb, "
+                "user_note, bepo_summary, tags, mood, place_hint "
                 "FROM memories"
             )
             rows = cursor.fetchall()
@@ -418,6 +468,11 @@ async def search_memories(
                 "image_path": row["image_path"],
                 "image_url": build_image_url(memory_id),
                 "note": row["text_note"],
+                "user_note": row["user_note"],
+                "bepo_summary": row["bepo_summary"],
+                "tags": row["tags"],
+                "mood": row["mood"],
+                "place_hint": row["place_hint"],
                 "lat": lat,
                 "lon": lon,
                 "map_url": build_map_url(lat, lon),
@@ -448,26 +503,15 @@ async def list_memories():
     try:
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT id, ts, lat, lon, image_path, text_note "
+            "SELECT id, ts, lat, lon, image_path, text_note, "
+            "user_note, bepo_summary, tags, mood, place_hint "
             "FROM memories ORDER BY ts DESC"
         )
         rows = cursor.fetchall()
     finally:
         conn.close()
 
-    return [
-        {
-            "id": row["id"],
-            "timestamp": row["ts"],
-            "note": row["text_note"],
-            "lat": row["lat"],
-            "lon": row["lon"],
-            "image_path": row["image_path"],
-            "image_url": build_image_url(row["id"]),
-            "map_url": build_map_url(row["lat"], row["lon"]),
-        }
-        for row in rows
-    ]
+    return [row_to_memory_response(row) for row in rows]
 
 
 @app.get("/memory/{memory_id}")
@@ -495,7 +539,7 @@ async def root():
     """Root endpoint with API information"""
     return {
         "app": "Bepo",
-        "version": "0.2",
+        "version": "0.3",
         "description": "Memory storage and search with image and text embeddings",
         "endpoints": {
             "POST /memory": "Store a new memory with photo, note, and GPS",
