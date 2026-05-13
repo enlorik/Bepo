@@ -252,11 +252,16 @@ Returns API version information and a list of available endpoints.
 ## Running Tests
 
 ```bash
-pip install pytest httpx
+pip install -r requirements-dev.txt
 python -m pytest tests/ -v
 ```
 
-Tests use a temporary in-memory database and never attempt to download the CLIP model.
+Tests disable CLIP/model downloads and run against temporary SQLite DB/filesystem paths (not your local `memories.db` or `images/`).
+
+## CI
+
+GitHub Actions runs `python -m pytest tests/ -v` on every pull request and on pushes to `main`.
+CI sets `TRANSFORMERS_OFFLINE=1` and `HF_HUB_OFFLINE=1` defensively so tests never rely on model downloads.
 
 ## Database Schema
 

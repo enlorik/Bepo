@@ -19,7 +19,9 @@ def isolated_db(tmp_path, monkeypatch):
     Point DB_PATH / IMAGES_DIR at temp paths and ensure CLIP is disabled
     so tests never attempt a model download.
     """
-    # Suppress CLIP – must be patched before init_db/lifespan runs
+    # Force offline mode and suppress CLIP before init_db/lifespan runs
+    monkeypatch.setenv("TRANSFORMERS_OFFLINE", "1")
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
     monkeypatch.setattr(app_module, "USE_CLIP", False)
     monkeypatch.setattr(app_module, "model", None)
     monkeypatch.setattr(app_module, "processor", None)
