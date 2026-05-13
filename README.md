@@ -79,6 +79,53 @@ curl -X POST "http://127.0.0.1:8000/memory" \
 
 ---
 
+### PATCH /memory/{id}/metadata
+
+Update editable memory metadata after a memory is created. This prepares Bepo for future chat-based memory annotation by letting later context refine what Bepo remembers about a photo.
+
+**Request body (JSON, all fields optional):**
+- `note` (string or `null`)
+- `user_note` (string or `null`)
+- `bepo_summary` (string or `null`)
+- `tags` (string or `null`)
+- `mood` (string or `null`)
+- `place_hint` (string or `null`)
+
+If a field is omitted, the existing value is preserved. If a field is sent as `null`, that field is cleared. After every metadata update, Bepo rebuilds the text embedding from the current text fields so search reflects the updated memory meaning.
+
+**Example:**
+```bash
+curl -X PATCH "http://127.0.0.1:8000/memory/1/metadata" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "user_note": "I remember the quiet corner table",
+    "tags": "cafe,quiet,corner",
+    "mood": "peaceful",
+    "place_hint": "near the back window"
+  }'
+```
+
+**Response:**
+```json
+{
+  "id": 1,
+  "timestamp": "2024-01-01T12:00:00.000000",
+  "note": "Beautiful sunset at the beach",
+  "user_note": "I remember the quiet corner table",
+  "bepo_summary": null,
+  "tags": "cafe,quiet,corner",
+  "mood": "peaceful",
+  "place_hint": "near the back window",
+  "lat": 34.0522,
+  "lon": -118.2437,
+  "image_path": "images/20240101_120000_000000.jpg",
+  "image_url": "/image/1",
+  "map_url": "https://www.google.com/maps/search/?api=1&query=34.0522,-118.2437"
+}
+```
+
+---
+
 ### GET /memories
 
 Return all saved memories, newest first. Embeddings are not included.

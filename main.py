@@ -8,6 +8,7 @@ import numpy as np
 from PIL import Image
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import FileResponse
+from pydantic import BaseModel
 import uvicorn
 
 # Database configuration
@@ -39,6 +40,24 @@ async def lifespan(app: FastAPI):
 
 # Initialize FastAPI app with lifespan
 app = FastAPI(title="Bepo - Memory Storage and Search", lifespan=lifespan)
+
+METADATA_FIELDS = (
+    "note",
+    "user_note",
+    "bepo_summary",
+    "tags",
+    "mood",
+    "place_hint",
+)
+
+
+class MemoryMetadataUpdate(BaseModel):
+    note: Optional[str] = None
+    user_note: Optional[str] = None
+    bepo_summary: Optional[str] = None
+    tags: Optional[str] = None
+    mood: Optional[str] = None
+    place_hint: Optional[str] = None
 
 def init_model():
     """Initialize CLIP model for embeddings"""
@@ -268,6 +287,20 @@ def row_to_memory_response(row: sqlite3.Row) -> dict:
     }
 
 
+def metadata_payload_to_updates(payload: MemoryMetadataUpdate) -> dict:
+    """Return explicitly set editable fields, mapping API `note` to DB `text_note`."""
+    dump_method = getattr(payload, "model_dump", None)
+    if dump_method is None:
+        provided_fields = payload.dict(exclude_unset=True).keys()
+    else:
+        provided_fields = dump_method(exclude_unset=True).keys()
+    return {
+        "text_note" if field == "note" else field: getattr(payload, field)
+        for field in METADATA_FIELDS
+        if field in provided_fields
+    }
+
+
 def fetch_memory_by_id(memory_id: int) -> Optional[sqlite3.Row]:
     """Return the database row for *memory_id*, or None if not found."""
     conn = get_db_connection()
@@ -408,6 +441,69 @@ async def create_memory(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error creating memory: {str(e)}")
 
+
+@app.patch("/memory/{memory_id}/metadata")
+async def update_memory_metadata(memory_id: int, payload: MemoryMetadataUpdate):
+    """Update editable memory metadata fields and refresh the text embedding."""
+    existing_row = fetch_memory_by_id(memory_id)
+    if existing_row is None:
+        raise HTTPException(status_code=404, detail=f"Memory {memory_id} not found")
+
+    updates = metadata_payload_to_updates(payload)
+    merged_values = {
+        "text_note": existing_row["text_note"],
+        "user_note": existing_row["user_note"],
+        "bepo_summary": existing_row["bepo_summary"],
+        "tags": existing_row["tags"],
+        "mood": existing_row["mood"],
+        "place_hint": existing_row["place_hint"],
+    }
+    merged_values.update(updates)
+
+    combined_text = build_combined_text(
+        merged_values["text_note"],
+        merged_values["user_note"],
+        merged_values["bepo_summary"],
+        merged_values["tags"],
+        merged_values["mood"],
+        merged_values["place_hint"],
+    )
+    serialized_text_emb = None
+    if combined_text is not None:
+        serialized_text_emb = serialize_embedding(get_text_embedding(combined_text))
+
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            UPDATE memories
+            SET text_note = ?, user_note = ?, bepo_summary = ?, tags = ?, mood = ?, place_hint = ?, text_emb = ?
+            WHERE id = ?
+            """,
+            (
+                merged_values["text_note"],
+                merged_values["user_note"],
+                merged_values["bepo_summary"],
+                merged_values["tags"],
+                merged_values["mood"],
+                merged_values["place_hint"],
+                serialized_text_emb,
+                memory_id,
+            ),
+        )
+        conn.commit()
+        cursor.execute(
+            "SELECT id, ts, lat, lon, image_path, text_note, user_note, bepo_summary, tags, mood, place_hint "
+            "FROM memories WHERE id = ?",
+            (memory_id,),
+        )
+        updated_row = cursor.fetchone()
+    finally:
+        conn.close()
+
+    return row_to_memory_response(updated_row)
+
 @app.post("/search")
 async def search_memories(
     query: str = Form(...),
@@ -539,10 +635,11 @@ async def root():
     """Root endpoint with API information"""
     return {
         "app": "Bepo",
-        "version": "0.3",
+        "version": "0.4",
         "description": "Memory storage and search with image and text embeddings",
         "endpoints": {
             "POST /memory": "Store a new memory with photo, note, and GPS",
+            "PATCH /memory/{id}/metadata": "Update editable memory metadata and refresh text embeddings",
             "GET /memories": "List all memories, newest first",
             "GET /memory/{id}": "Get a single memory by id",
             "GET /image/{id}": "Serve the image for a memory",
