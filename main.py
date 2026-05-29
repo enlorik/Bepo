@@ -8,7 +8,7 @@ import numpy as np
 from PIL import Image
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 import uvicorn
 
 # Database configuration
@@ -58,6 +58,18 @@ class MemoryMetadataUpdate(BaseModel):
     tags: Optional[str] = None
     mood: Optional[str] = None
     place_hint: Optional[str] = None
+
+
+class ChatRequest(BaseModel):
+    message: str
+    top_k: int = Field(default=3, ge=1, le=10)
+
+    @field_validator("message")
+    @classmethod
+    def message_not_whitespace(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("message must not be empty or whitespace")
+        return v
 
 def init_model():
     """Initialize CLIP model for embeddings"""
@@ -352,6 +364,87 @@ def deserialize_embedding(data: bytes) -> np.ndarray:
     buffer = io.BytesIO(data)
     return np.load(buffer)
 
+
+def search_memory_matches(query: str, top_k: int) -> list:
+    """Return up to top_k scored memory dicts for query, sorted by score descending."""
+    query_emb = get_text_embedding(query)
+
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT id, ts, lat, lon, image_path, image_emb, text_note, text_emb, "
+            "user_note, bepo_summary, tags, mood, place_hint "
+            "FROM memories"
+        )
+        rows = cursor.fetchall()
+    finally:
+        conn.close()
+
+    if not rows:
+        return []
+
+    scored = []
+    for row in rows:
+        image_emb = deserialize_embedding(row["image_emb"])
+        image_score = cosine_similarity(query_emb, image_emb)
+
+        text_score = -1.0
+        if row["text_emb"] is not None:
+            text_emb_arr = deserialize_embedding(row["text_emb"])
+            text_score = cosine_similarity(query_emb, text_emb_arr)
+
+        score = max(image_score, text_score)
+        memory_id = row["id"]
+        lat = row["lat"]
+        lon = row["lon"]
+        scored.append({
+            "id": memory_id,
+            "timestamp": row["ts"],
+            "image_path": row["image_path"],
+            "image_url": build_image_url(memory_id),
+            "note": row["text_note"],
+            "user_note": row["user_note"],
+            "bepo_summary": row["bepo_summary"],
+            "tags": row["tags"],
+            "mood": row["mood"],
+            "place_hint": row["place_hint"],
+            "lat": lat,
+            "lon": lon,
+            "map_url": build_map_url(lat, lon),
+            "score": score,
+        })
+
+    scored.sort(key=lambda x: x["score"], reverse=True)
+    return scored[:top_k]
+
+
+def build_chat_answer(top: dict) -> str:
+    """Build a simple deterministic answer from the top memory match."""
+    sentences = []
+
+    if top.get("place_hint"):
+        sentences.append(f"You may mean the memory near {top['place_hint']}.")
+    else:
+        sentences.append("You may mean this memory.")
+
+    description = top.get("bepo_summary") or top.get("user_note") or top.get("note")
+    if description:
+        sentences.append(f'I recall: "{description}".')
+
+    details = []
+    if top.get("mood"):
+        details.append(top["mood"])
+    if top.get("tags"):
+        details.extend(t.strip() for t in top["tags"].split(",") if t.strip())
+    if details:
+        sentences.append(f"I remember it as {', '.join(details)}.")
+
+    if top.get("map_url"):
+        sentences.append("A map link is available.")
+
+    return " ".join(sentences)
+
 @app.post("/memory")
 async def create_memory(
     photo: UploadFile = File(...),
@@ -513,71 +606,20 @@ async def search_memories(
     Search memories by text query.
     Returns up to *top_k* matches sorted by score descending.
     """
-    # Validate inputs
     if not query or not query.strip():
         raise HTTPException(status_code=422, detail="query must not be empty or whitespace")
     if not (1 <= top_k <= 20):
         raise HTTPException(status_code=422, detail="top_k must be between 1 and 20")
 
     try:
-        # Generate query embedding
-        query_emb = get_text_embedding(query)
+        matches = search_memory_matches(query.strip(), top_k)
 
-        # Retrieve all memories with embeddings
-        conn = get_db_connection()
-        try:
-            cursor = conn.cursor()
-            cursor.execute(
-                "SELECT id, ts, lat, lon, image_path, image_emb, text_note, text_emb, "
-                "user_note, bepo_summary, tags, mood, place_hint "
-                "FROM memories"
-            )
-            rows = cursor.fetchall()
-        finally:
-            conn.close()
-
-        if not rows:
+        if not matches:
             return {
                 "status": "no_results",
                 "message": "No memories found in database",
                 "matches": [],
             }
-
-        # Score every memory
-        scored = []
-        for row in rows:
-            image_emb = deserialize_embedding(row["image_emb"])
-            image_score = cosine_similarity(query_emb, image_emb)
-
-            text_score = -1.0
-            if row["text_emb"] is not None:
-                text_emb = deserialize_embedding(row["text_emb"])
-                text_score = cosine_similarity(query_emb, text_emb)
-
-            score = max(image_score, text_score)
-            memory_id = row["id"]
-            lat = row["lat"]
-            lon = row["lon"]
-            scored.append({
-                "id": memory_id,
-                "timestamp": row["ts"],
-                "image_path": row["image_path"],
-                "image_url": build_image_url(memory_id),
-                "note": row["text_note"],
-                "user_note": row["user_note"],
-                "bepo_summary": row["bepo_summary"],
-                "tags": row["tags"],
-                "mood": row["mood"],
-                "place_hint": row["place_hint"],
-                "lat": lat,
-                "lon": lon,
-                "map_url": build_map_url(lat, lon),
-                "score": score,
-            })
-
-        # Sort by score descending and take top_k
-        scored.sort(key=lambda x: x["score"], reverse=True)
-        matches = scored[:top_k]
 
         return {
             "status": "success",
@@ -590,6 +632,37 @@ async def search_memories(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error searching memories: {str(e)}")
+
+
+@app.post("/chat")
+async def chat(request: ChatRequest):
+    """
+    Ask a natural question about saved memories.
+    Returns a simple deterministic answer built from the top matching memory.
+    """
+    try:
+        matches = search_memory_matches(request.message.strip(), request.top_k)
+
+        if not matches:
+            return {
+                "status": "no_results",
+                "message": request.message,
+                "answer": "I do not have any memories saved yet.",
+                "memories": [],
+            }
+
+        answer = build_chat_answer(matches[0])
+
+        return {
+            "status": "success",
+            "message": request.message,
+            "answer": answer,
+            "count": len(matches),
+            "memories": matches,
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error in chat: {str(e)}")
 
 
 @app.get("/memories")
@@ -635,7 +708,7 @@ async def root():
     """Root endpoint with API information"""
     return {
         "app": "Bepo",
-        "version": "0.4",
+        "version": "0.5",
         "description": "Memory storage and search with image and text embeddings",
         "endpoints": {
             "POST /memory": "Store a new memory with photo, note, and GPS",
@@ -644,6 +717,7 @@ async def root():
             "GET /memory/{id}": "Get a single memory by id",
             "GET /image/{id}": "Serve the image for a memory",
             "POST /search": "Search memories by text query (supports top_k parameter)",
+            "POST /chat": "Ask a natural question about saved memories",
         },
     }
 

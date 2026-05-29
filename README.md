@@ -245,6 +245,63 @@ curl -X POST "http://127.0.0.1:8000/search" \
 
 ---
 
+### POST /chat
+
+Ask a natural question about saved memories. Bepo retrieves the most relevant memories and returns a simple, friendly answer built from the top match's metadata. **This is a local, deterministic chat-lite endpoint — it does not call any LLM or external API.**
+
+**Request body (JSON):**
+- `message` (string, required): Your question or description (must not be empty or whitespace-only)
+- `top_k` (int, optional, default 3, min 1, max 10): Number of memories to retrieve
+
+**Example:**
+```bash
+curl -X POST "http://127.0.0.1:8000/chat" \
+  -H "Content-Type: application/json" \
+  -d '{"message": "Where was that calm cafe with the cat?", "top_k": 3}'
+```
+
+**Response (with results):**
+```json
+{
+  "status": "success",
+  "message": "Where was that calm cafe with the cat?",
+  "answer": "You may mean the memory near the red couch hallway. I remember it as calm, cafe, cat, cozy.",
+  "count": 1,
+  "memories": [
+    {
+      "id": 1,
+      "timestamp": "2024-01-01T12:00:00.000000",
+      "note": null,
+      "user_note": null,
+      "bepo_summary": null,
+      "tags": "cafe,cat,cozy",
+      "mood": "calm",
+      "place_hint": "near the red couch hallway",
+      "lat": null,
+      "lon": null,
+      "image_path": "images/20240101_120000_000000.jpg",
+      "image_url": "/image/1",
+      "map_url": null,
+      "score": 0.72
+    }
+  ]
+}
+```
+
+**Response (empty database):**
+```json
+{
+  "status": "no_results",
+  "message": "Where was that calm cafe with the cat?",
+  "answer": "I do not have any memories saved yet.",
+  "memories": []
+}
+```
+
+The answer is built locally from the top memory's metadata (place hint, mood, tags, note/summary). No OpenAI or external API is involved.
+
+---
+
 ### GET /
 
 Returns API version information and a list of available endpoints.

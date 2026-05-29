@@ -459,6 +459,90 @@ class TestSearch:
         assert r2.status_code == 422
 
 
+class TestChat:
+    def test_no_results_on_empty_database(self, client):
+        r = client.post("/chat", json={"message": "Where was the calm cafe?"})
+        assert r.status_code == 200
+        data = r.json()
+        assert data["status"] == "no_results"
+        assert data["memories"] == []
+        assert data["answer"] == "I do not have any memories saved yet."
+
+    def test_rejects_empty_message(self, client):
+        r = client.post("/chat", json={"message": ""})
+        assert r.status_code == 422
+
+    def test_rejects_whitespace_only_message(self, client):
+        r = client.post("/chat", json={"message": "   "})
+        assert r.status_code == 422
+
+    def test_rejects_top_k_below_min(self, client):
+        r = client.post("/chat", json={"message": "test", "top_k": 0})
+        assert r.status_code == 422
+
+    def test_rejects_top_k_above_max(self, client):
+        r = client.post("/chat", json={"message": "test", "top_k": 11})
+        assert r.status_code == 422
+
+    def test_returns_relevant_memory_after_creating_one(self, client):
+        client.post(
+            "/memory",
+            files={"photo": ("img.jpg", _tiny_jpeg(), "image/jpeg")},
+            data={"note": "quiet cafe with a cat", "mood": "calm", "tags": "cafe,cat"},
+        )
+        r = client.post("/chat", json={"message": "cafe with a cat"})
+        assert r.status_code == 200
+        data = r.json()
+        assert data["status"] == "success"
+        assert data["count"] >= 1
+        assert len(data["memories"]) >= 1
+        assert data["memories"][0]["note"] == "quiet cafe with a cat"
+
+    def test_answer_includes_useful_metadata_from_top_memory(self, client):
+        client.post(
+            "/memory",
+            files={"photo": ("img.jpg", _tiny_jpeg(), "image/jpeg")},
+            data={
+                "mood": "calm",
+                "tags": "cafe,cat,cozy",
+                "place_hint": "near the red couch hallway",
+            },
+        )
+        r = client.post("/chat", json={"message": "calm cafe with a cat"})
+        assert r.status_code == 200
+        data = r.json()
+        assert data["status"] == "success"
+        answer = data["answer"]
+        # Answer should reference the place hint and/or mood/tags
+        assert any(kw in answer for kw in ["red couch", "calm", "cafe", "cat", "cozy"])
+
+    def test_does_not_expose_embeddings(self, client):
+        client.post(
+            "/memory",
+            files={"photo": ("img.jpg", _tiny_jpeg(), "image/jpeg")},
+            data={"note": "test memory"},
+        )
+        r = client.post("/chat", json={"message": "test"})
+        assert r.status_code == 200
+        data = r.json()
+        for memory in data["memories"]:
+            assert "image_emb" not in memory
+            assert "text_emb" not in memory
+
+    def test_search_still_works_after_helper_refactor(self, client):
+        client.post(
+            "/memory",
+            files={"photo": ("img.jpg", _tiny_jpeg(), "image/jpeg")},
+            data={"note": "ocean at dusk"},
+        )
+        r = client.post("/search", data={"query": "ocean", "top_k": "3"})
+        assert r.status_code == 200
+        data = r.json()
+        assert data["status"] == "success"
+        assert data["count"] >= 1
+        assert data["matches"][0]["note"] == "ocean at dusk"
+
+
 class TestBuildMapUrl:
     def test_returns_url_when_coords_present(self):
         url = app_module.build_map_url(34.0522, -118.2437)
