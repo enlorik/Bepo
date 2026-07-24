@@ -361,3 +361,13 @@ This application runs entirely locally:
 - Images saved to local `images/` directory
 - Both `memories.db` and `images/` are excluded from git
 - All processing done on your machine
+
+## Design notes
+
+**Why CLIP** — CLIP (Contrastive Language–Image Pretraining) was trained on 400 million image–caption pairs with a contrastive objective that pushes matching pairs together in a shared embedding space. The result is that the image encoder and text encoder share a coordinate system: the query "red couch" lands near photographs of red couches without any captioning step, keyword tags, or OCR.
+
+**Why max instead of average for score fusion** — Each memory gets two scores: one from the image channel, one from the text channel. A photo of a red couch captioned "grandma's visit" should surface for "red couch" (image fires) and for "grandma" (text fires). Averaging would dilute a strong single-channel match with an irrelevant score from the other channel. The tradeoff is that matching both channels simultaneously isn't rewarded extra — a weighted sum is the tuning knob if that matters later.
+
+**Why an exact scan instead of an approximate index** — 10,000 memories is around 5 million multiply-adds in NumPy, which takes milliseconds. Adding FAISS or hnswlib at that scale would add complexity and trade exactness for a speed gain that isn't needed. The upgrade path when scale demands it: matrix-ise the scan first (`M @ q`, one BLAS call), cache the matrix in RAM, then add an ANN index when the collection approaches 10⁵ entries or becomes multi-user.
+
+**Why SQLite with BLOB embeddings** — Everything runs on one machine with no external service dependency. A single file is straightforward to back up and reason about. The cost is no vector index (hence the exact scan) and two sources of truth: the database holds a path, the actual image file lives on the filesystem.
