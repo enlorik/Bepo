@@ -2,6 +2,8 @@
 
 A local Python FastAPI application for storing and searching memories with images, text notes, richer memory metadata, and GPS coordinates using CLIP embeddings.
 
+![Bepo screenshot](docs/screenshot.png)
+
 ## Features
 
 - **Store Memories**: Upload photos with optional notes, richer metadata, and GPS coordinates
