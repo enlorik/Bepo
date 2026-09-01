@@ -1,6 +1,6 @@
 # Bepo
 
-A local Python FastAPI application for storing and searching memories with images, text notes, richer memory metadata, and GPS coordinates using CLIP embeddings.
+A Python FastAPI application for storing and searching memories with images, text notes, richer memory metadata, and GPS coordinates. It runs locally or as a small hosted Railway service.
 
 ![Bepo screenshot](docs/screenshot.png)
 
@@ -10,12 +10,12 @@ A local Python FastAPI application for storing and searching memories with image
 - **List & Retrieve Memories**: Browse all memories or fetch a single one by id
 - **Serve Images**: Dedicated endpoint for serving stored image files
 - **Semantic Search**: Search memories using natural language queries with configurable result count
-- **CLIP Embeddings**: Uses OpenAI's CLIP model for image and text embeddings (falls back to simple features when CLIP is unavailable)
+- **Optional CLIP Embeddings**: Uses OpenAI's CLIP model for image and text embeddings when enabled, with a lightweight fallback for small deployments
 - **Cosine Similarity**: Ranks matches by semantic similarity
 - **SQLite Storage**: Local database with efficient BLOB storage for embeddings
-- **Image Storage**: Saves uploaded images to local filesystem
+- **Image Storage**: Saves uploaded images to the local filesystem or an attached Railway volume
 
-> **Note:** `memories.db` and the `images/` directory are local runtime data and are excluded from version control via `.gitignore`.
+> **Note:** `memories.db` and the `images/` directory are runtime data and are excluded from version control via `.gitignore`. When Railway attaches a volume, Bepo automatically stores both on that persistent volume.
 
 ## Installation
 
@@ -24,12 +24,48 @@ A local Python FastAPI application for storing and searching memories with image
 pip install -r requirements.txt
 ```
 
+The default installation uses lightweight fallback embeddings. To enable the full CLIP model locally, install the optional dependencies and set the feature flag:
+
+```bash
+pip install -r requirements-clip.txt
+BEPO_ENABLE_CLIP=1 python main.py
+```
+
 2. Run the application:
 ```bash
 python main.py
 ```
 
 The API will be available at `http://127.0.0.1:8000`
+
+## Railway deployment
+
+Bepo is ready for Railway's automatic Python build detection. The server reads Railway's injected `PORT` value and listens on all network interfaces.
+
+1. Create a Railway project from the `enlorik/Bepo` GitHub repository.
+2. Attach a persistent volume to the Bepo service and mount it at `/data`. Bepo automatically uses Railway's volume mount path for the SQLite database and uploaded images.
+3. Add a service variable named `BEPO_API_KEY` with a long random value. When this variable is present, every application endpoint requires the value in an `X-API-Key` header. `/health` remains public for Railway.
+4. Set the service healthcheck path to `/health`.
+5. Generate a public domain under the service's Networking settings.
+
+Verify the deployment:
+
+```bash
+curl https://YOUR-DOMAIN.up.railway.app/health
+curl -H "X-API-Key: YOUR_SECRET" https://YOUR-DOMAIN.up.railway.app/
+```
+
+The lightweight hosted setup avoids downloading a large machine-learning model during startup. If the Railway service has enough memory and disk for CLIP, change its install command to `pip install -r requirements-clip.txt` and set `BEPO_ENABLE_CLIP=1`.
+
+### Runtime variables
+
+- `BEPO_API_KEY`: optional locally; strongly recommended for every public deployment
+- `BEPO_DATA_DIR`: directory containing `memories.db` and `images/`
+- `BEPO_DB_PATH`: overrides the SQLite file path
+- `BEPO_IMAGES_DIR`: overrides the uploaded-image directory
+- `BEPO_ENABLE_CLIP`: set to `1` to enable CLIP when its optional dependencies are installed
+- `HOST`: server bind address; defaults to `0.0.0.0`
+- `PORT`: server port; defaults to `8000`
 
 ## API Endpoints
 
@@ -350,19 +386,20 @@ For semantic search, Bepo builds text embeddings from all available memory text 
 
 - **FastAPI**: Web framework for the REST API
 - **SQLite**: Local database for storing memories and embeddings
-- **CLIP (openai/clip-vit-base-patch32)**: Generates embeddings for images and text
+- **Optional CLIP (openai/clip-vit-base-patch32)**: Generates richer embeddings for images and text when enabled
 - **PIL (Pillow)**: Image processing
-- **PyTorch**: Deep learning framework for CLIP
+- **Optional PyTorch**: Deep learning framework used by CLIP
 - **NumPy**: Efficient array operations and cosine similarity calculation
 
-## Local Only
+## Data and external services
 
-This application runs entirely locally:
-- No external API calls (except for initial CLIP model download)
-- All data stored locally in SQLite database (`memories.db`)
-- Images saved to local `images/` directory
+Bepo does not call a hosted AI API. All processing happens inside the running Bepo service:
+- The default lightweight mode makes no external model calls
+- Optional CLIP mode downloads its model on first startup unless it is already cached
+- Memory records stay in SQLite (`memories.db`)
+- Images stay in the configured `images/` directory
+- On Railway, attach a persistent volume so both survive deploys and restarts
 - Both `memories.db` and `images/` are excluded from git
-- All processing done on your machine
 
 ## Design notes
 

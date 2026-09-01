@@ -25,6 +25,7 @@ def isolated_db(tmp_path, monkeypatch):
     monkeypatch.setattr(app_module, "USE_CLIP", False)
     monkeypatch.setattr(app_module, "model", None)
     monkeypatch.setattr(app_module, "processor", None)
+    monkeypatch.setattr(app_module, "API_KEY", None)
     # Replace init_model with a no-op so lifespan never touches the network
     monkeypatch.setattr(app_module, "init_model", lambda: None)
 
@@ -78,6 +79,23 @@ class TestRoot:
         data = r.json()
         assert data["app"] == "Bepo"
         assert "endpoints" in data
+
+    def test_health_is_public(self, client, monkeypatch):
+        monkeypatch.setattr(app_module, "API_KEY", "test-secret")
+        r = client.get("/health")
+        assert r.status_code == 200
+        assert r.json() == {"status": "ok"}
+
+    def test_configured_api_key_protects_application_routes(self, client, monkeypatch):
+        monkeypatch.setattr(app_module, "API_KEY", "test-secret")
+
+        missing = client.get("/")
+        invalid = client.get("/", headers={"X-API-Key": "wrong"})
+        valid = client.get("/", headers={"X-API-Key": "test-secret"})
+
+        assert missing.status_code == 401
+        assert invalid.status_code == 401
+        assert valid.status_code == 200
 
 
 class TestListMemories:

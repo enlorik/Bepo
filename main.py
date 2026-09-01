@@ -1,4 +1,5 @@
 import os
+import secrets
 import sqlite3
 import io
 from datetime import datetime
@@ -6,27 +7,46 @@ from typing import Optional
 from contextlib import asynccontextmanager
 import numpy as np
 from PIL import Image
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import APIRouter, Depends, FastAPI, UploadFile, File, Form, HTTPException, Security
 from fastapi.responses import FileResponse
+from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field, field_validator
 import uvicorn
 
-# Database configuration
-DB_PATH = "memories.db"
-IMAGES_DIR = "images"
+# Runtime configuration. Railway provides RAILWAY_VOLUME_MOUNT_PATH when a
+# persistent volume is attached, while local development continues to use the
+# repository directory by default.
+DATA_DIR = (
+    os.getenv("BEPO_DATA_DIR")
+    or os.getenv("RAILWAY_VOLUME_MOUNT_PATH")
+    or "."
+)
+DB_PATH = os.getenv("BEPO_DB_PATH") or os.path.join(DATA_DIR, "memories.db")
+IMAGES_DIR = os.getenv("BEPO_IMAGES_DIR") or os.path.join(DATA_DIR, "images")
+API_KEY = os.getenv("BEPO_API_KEY") or None
 
-# Try to import and use CLIP if available, otherwise use fallback
-USE_CLIP = False
+
+def env_flag(name: str, default: bool = False) -> bool:
+    """Return a boolean environment flag with conservative parsing."""
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+# CLIP is opt-in so small hosted deployments can start quickly and reliably.
+# Install requirements-clip.txt and set BEPO_ENABLE_CLIP=1 to enable it.
+USE_CLIP = env_flag("BEPO_ENABLE_CLIP")
 model = None
 processor = None
 
-try:
-    from transformers import CLIPProcessor, CLIPModel
-    import torch
-    import torch.nn.functional as F
-    USE_CLIP = True
-except ImportError:
-    print("CLIP not available, using fallback embeddings")
+if USE_CLIP:
+    try:
+        from transformers import CLIPProcessor, CLIPModel
+        import torch
+        import torch.nn.functional as F
+    except ImportError:
+        print("CLIP dependencies are unavailable; using fallback embeddings")
+        USE_CLIP = False
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -40,6 +60,22 @@ async def lifespan(app: FastAPI):
 
 # Initialize FastAPI app with lifespan
 app = FastAPI(title="Bepo - Memory Storage and Search", lifespan=lifespan)
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+
+async def require_api_key(provided_api_key: Optional[str] = Security(api_key_header)):
+    """Require the configured API key while keeping local development simple."""
+    if API_KEY is None:
+        return
+    if provided_api_key is None or not secrets.compare_digest(provided_api_key, API_KEY):
+        raise HTTPException(
+            status_code=401,
+            detail="Missing or invalid API key",
+            headers={"WWW-Authenticate": "ApiKey"},
+        )
+
+
+router = APIRouter(dependencies=[Depends(require_api_key)])
 
 METADATA_FIELDS = (
     "note",
@@ -92,6 +128,7 @@ def init_model():
 def init_db():
     """Initialize SQLite database and create tables"""
     os.makedirs(IMAGES_DIR, exist_ok=True)
+    os.makedirs(os.path.dirname(os.path.abspath(DB_PATH)), exist_ok=True)
     
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
@@ -445,7 +482,7 @@ def build_chat_answer(top: dict) -> str:
 
     return " ".join(sentences)
 
-@app.post("/memory")
+@router.post("/memory")
 async def create_memory(
     photo: UploadFile = File(...),
     note: Optional[str] = Form(None),
@@ -535,7 +572,7 @@ async def create_memory(
         raise HTTPException(status_code=500, detail=f"Error creating memory: {str(e)}")
 
 
-@app.patch("/memory/{memory_id}/metadata")
+@router.patch("/memory/{memory_id}/metadata")
 async def update_memory_metadata(memory_id: int, payload: MemoryMetadataUpdate):
     """Update editable memory metadata fields and refresh the text embedding."""
     existing_row = fetch_memory_by_id(memory_id)
@@ -597,7 +634,7 @@ async def update_memory_metadata(memory_id: int, payload: MemoryMetadataUpdate):
 
     return row_to_memory_response(updated_row)
 
-@app.post("/search")
+@router.post("/search")
 async def search_memories(
     query: str = Form(...),
     top_k: int = Form(5),
@@ -634,7 +671,7 @@ async def search_memories(
         raise HTTPException(status_code=500, detail=f"Error searching memories: {str(e)}")
 
 
-@app.post("/chat")
+@router.post("/chat")
 async def chat(request: ChatRequest):
     """
     Ask a natural question about saved memories.
@@ -665,7 +702,7 @@ async def chat(request: ChatRequest):
         raise HTTPException(status_code=500, detail=f"Error in chat: {str(e)}")
 
 
-@app.get("/memories")
+@router.get("/memories")
 async def list_memories():
     """Return all saved memories, newest first. Embeddings are not included."""
     conn = get_db_connection()
@@ -683,7 +720,7 @@ async def list_memories():
     return [row_to_memory_response(row) for row in rows]
 
 
-@app.get("/memory/{memory_id}")
+@router.get("/memory/{memory_id}")
 async def get_memory(memory_id: int):
     """Return a single memory by id. Returns 404 if not found."""
     row = fetch_memory_by_id(memory_id)
@@ -692,7 +729,7 @@ async def get_memory(memory_id: int):
     return row_to_memory_response(row)
 
 
-@app.get("/image/{memory_id}")
+@router.get("/image/{memory_id}")
 async def get_image(memory_id: int):
     """Serve the image file associated with a memory. Returns 404 if not found."""
     row = fetch_memory_by_id(memory_id)
@@ -703,12 +740,12 @@ async def get_image(memory_id: int):
         raise HTTPException(status_code=404, detail=f"Image file not found for memory {memory_id}")
     return FileResponse(image_path)
 
-@app.get("/")
+@router.get("/")
 async def root():
     """Root endpoint with API information"""
     return {
         "app": "Bepo",
-        "version": "0.5",
+        "version": "0.6",
         "description": "Memory storage and search with image and text embeddings",
         "endpoints": {
             "POST /memory": "Store a new memory with photo, note, and GPS",
@@ -721,5 +758,18 @@ async def root():
         },
     }
 
+
+app.include_router(router)
+
+
+@app.get("/health", include_in_schema=False)
+async def health():
+    """Return a public liveness response for deployment health checks."""
+    return {"status": "ok"}
+
 if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    uvicorn.run(
+        app,
+        host=os.getenv("HOST", "0.0.0.0"),
+        port=int(os.getenv("PORT", "8000")),
+    )
