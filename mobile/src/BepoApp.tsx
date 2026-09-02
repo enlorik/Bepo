@@ -1,4 +1,5 @@
 import { StatusBar } from 'expo-status-bar';
+import { File } from 'expo-file-system';
 import * as ImagePicker from 'expo-image-picker';
 import * as Location from 'expo-location';
 import * as SecureStore from 'expo-secure-store';
@@ -387,7 +388,8 @@ function AddScreen({ request, onSaved }: { request: Requester; onSaved: () => vo
     setSaving(true);
     try {
       const form = new FormData();
-      form.append('photo', { uri: photo.uri, name: photo.fileName || `bepo-${Date.now()}.jpg`, type: photo.mimeType || 'image/jpeg' } as any);
+      const photoFile = new File(photo.uri);
+      form.append('photo', photoFile, photo.fileName || photoFile.name || `bepo-${Date.now()}.jpg`);
       if (note.trim()) form.append('note', note.trim());
       if (tags.trim()) form.append('tags', tags.trim());
       if (mood.trim()) form.append('mood', mood.trim());
@@ -578,3 +580,4 @@ function PrimaryButton({ label, onPress, disabled = false }: { label: string; on
 function SecondaryButton({ label, onPress }: { label: string; onPress: () => void }) {
   return <Pressable style={styles.secondaryButton} onPress={onPress}><Text style={styles.secondaryButtonText}>{label}</Text></Pressable>;
 }
+
