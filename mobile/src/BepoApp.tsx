@@ -1,4 +1,5 @@
 import { File } from 'expo-file-system';
+import Ionicons from '@expo/vector-icons/Ionicons';
 import * as ImagePicker from 'expo-image-picker';
 import * as Location from 'expo-location';
 import * as SecureStore from 'expo-secure-store';
@@ -420,7 +421,7 @@ function ChatScreen({
 
   return (
     <View style={styles.fill}>
-      <ChatHeader memoryCount={memoryCount} onOpenMemories={onOpenMemories} onOpenSettings={onOpenSettings} />
+      <ChatControls memoryCount={memoryCount} onOpenMemories={onOpenMemories} onOpenSettings={onOpenSettings} />
       <KeyboardAvoidingView style={styles.fill} behavior={Platform.OS === 'ios' ? 'padding' : undefined} keyboardVerticalOffset={0}>
         <FlatList
           ref={listRef}
@@ -449,12 +450,10 @@ function ChatScreen({
           <View style={styles.composer}>
             <View style={styles.composerTools}>
               <Pressable accessibilityLabel="Take a photo" style={styles.composerToolButton} onPress={() => choosePhoto('camera')}>
-                <Text style={styles.composerToolGlyph}>◎</Text>
-                <Text style={styles.composerToolLabel}>Camera</Text>
+                <Ionicons name="camera-outline" size={22} color="#393936" />
               </Pressable>
               <Pressable accessibilityLabel="Choose from photos" style={styles.composerToolButton} onPress={() => choosePhoto('library')}>
-                <Text style={styles.composerToolGlyph}>▧</Text>
-                <Text style={styles.composerToolLabel}>Photos</Text>
+                <Ionicons name="images-outline" size={21} color="#393936" />
               </Pressable>
             </View>
             <TextInput
@@ -462,7 +461,7 @@ function ChatScreen({
               value={draft}
               onChangeText={setDraft}
               multiline
-              placeholder={pendingPhoto ? 'Add what you remember…' : 'Ask Bepo anything…'}
+              placeholder={pendingPhoto ? 'Add what you remember…' : 'Message Bepo…'}
               placeholderTextColor="#8B8B85"
             />
             <Pressable
@@ -471,39 +470,29 @@ function ChatScreen({
               onPress={() => sendMessage()}
               disabled={!canSend}
             >
-              <Text style={styles.sendButtonText}>↑</Text>
+              <Ionicons name="arrow-up" size={21} color="#FFFFFF" />
             </Pressable>
           </View>
-          <Text style={styles.composerHint}>
-            {pendingPhoto ? 'This photo will become a memory.' : 'A photo becomes a memory. Text alone asks a question.'}
-          </Text>
         </View>
       </KeyboardAvoidingView>
     </View>
   );
 }
 
-function ChatHeader({ memoryCount, onOpenMemories, onOpenSettings }: {
+function ChatControls({ memoryCount, onOpenMemories, onOpenSettings }: {
   memoryCount: number;
   onOpenMemories: () => void;
   onOpenSettings: () => void;
 }) {
   return (
-    <View style={styles.chatHeader}>
-      <View style={styles.headerIdentity}>
-        <BrandMark size={38} />
-        <View>
-          <Text style={styles.chatHeaderTitle}>Bepo</Text>
-          <Text style={styles.chatHeaderSubtitle}>Your private memory companion</Text>
-        </View>
-      </View>
+    <View style={styles.chatControls}>
       <View style={styles.headerActions}>
         <Pressable accessibilityLabel="Open memories" style={styles.headerButton} onPress={onOpenMemories}>
-          <Text style={styles.headerButtonText}>▦</Text>
+          <Ionicons name="albums-outline" size={22} color="#393936" />
           {memoryCount ? <View style={styles.memoryBadge}><Text style={styles.memoryBadgeText}>{memoryCount > 99 ? '99+' : memoryCount}</Text></View> : null}
         </Pressable>
         <Pressable accessibilityLabel="Open settings" style={styles.headerButton} onPress={onOpenSettings}>
-          <Text style={styles.headerButtonText}>•••</Text>
+          <Ionicons name="ellipsis-horizontal" size={23} color="#393936" />
         </Pressable>
       </View>
     </View>

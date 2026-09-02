@@ -17,7 +17,7 @@ const palette = {
 export const styles = StyleSheet.create({
   app: { flex: 1, backgroundColor: palette.background },
   fill: { flex: 1 },
-  safeTop: { height: Platform.OS === 'ios' ? 52 : 28, backgroundColor: palette.surface },
+  safeTop: { height: Platform.OS === 'ios' ? 52 : 28, backgroundColor: palette.background },
   centeredPage: { flex: 1, alignItems: 'center', justifyContent: 'center', backgroundColor: palette.background },
   loadingMark: { marginTop: 20 },
 
@@ -27,22 +27,16 @@ export const styles = StyleSheet.create({
   setupTitle: { marginTop: 8, color: palette.text, fontSize: 42, lineHeight: 48, fontWeight: '600' },
   setupCopy: { marginTop: 12, marginBottom: 28, color: palette.muted, fontSize: 17, lineHeight: 25 },
 
-  chatHeader: {
-    height: 62,
-    paddingHorizontal: 14,
+  chatControls: {
+    height: 48,
+    paddingHorizontal: 10,
     flexDirection: 'row',
     alignItems: 'center',
-    justifyContent: 'space-between',
-    borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: palette.border,
-    backgroundColor: palette.surface,
+    justifyContent: 'flex-end',
+    backgroundColor: palette.background,
   },
-  headerIdentity: { flexDirection: 'row', alignItems: 'center', gap: 10 },
-  chatHeaderTitle: { color: palette.text, fontSize: 17, lineHeight: 21, fontWeight: '700' },
-  chatHeaderSubtitle: { marginTop: 1, color: palette.muted, fontSize: 11.5 },
-  headerActions: { flexDirection: 'row', alignItems: 'center', gap: 5 },
-  headerButton: { width: 40, height: 40, borderRadius: 20, alignItems: 'center', justifyContent: 'center' },
-  headerButtonText: { color: palette.text, fontSize: 20, lineHeight: 22, fontWeight: '600' },
+  headerActions: { flexDirection: 'row', alignItems: 'center', gap: 2 },
+  headerButton: { width: 38, height: 38, borderRadius: 19, alignItems: 'center', justifyContent: 'center' },
   memoryBadge: {
     position: 'absolute',
     right: 0,
@@ -106,11 +100,9 @@ export const styles = StyleSheet.create({
 
   composerArea: {
     paddingHorizontal: 12,
-    paddingTop: 9,
-    paddingBottom: Platform.OS === 'ios' ? 18 : 10,
-    borderTopWidth: StyleSheet.hairlineWidth,
-    borderTopColor: palette.border,
-    backgroundColor: palette.surface,
+    paddingTop: 7,
+    paddingBottom: Platform.OS === 'ios' ? 14 : 10,
+    backgroundColor: palette.background,
   },
   attachmentPreview: {
     marginBottom: 8,
@@ -139,12 +131,15 @@ export const styles = StyleSheet.create({
     borderRadius: 27,
     flexDirection: 'row',
     alignItems: 'flex-end',
-    backgroundColor: palette.background,
+    backgroundColor: palette.surface,
+    shadowColor: '#000000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.07,
+    shadowRadius: 8,
+    elevation: 3,
   },
-  composerTools: { flexDirection: 'row', alignItems: 'center', gap: 2, marginLeft: 2, marginRight: 3 },
-  composerToolButton: { minWidth: 42, height: 40, paddingHorizontal: 3, borderRadius: 14, alignItems: 'center', justifyContent: 'center' },
-  composerToolGlyph: { color: palette.text, fontSize: 18, lineHeight: 19 },
-  composerToolLabel: { marginTop: 1, color: palette.muted, fontSize: 8, lineHeight: 9, fontWeight: '600' },
+  composerTools: { flexDirection: 'row', alignItems: 'center', gap: 1, marginLeft: 2, marginRight: 2 },
+  composerToolButton: { width: 36, height: 40, borderRadius: 18, alignItems: 'center', justifyContent: 'center' },
   composerInput: {
     flex: 1,
     minHeight: 40,
@@ -159,8 +154,6 @@ export const styles = StyleSheet.create({
   },
   sendButton: { width: 40, height: 40, borderRadius: 20, alignItems: 'center', justifyContent: 'center', backgroundColor: palette.dark },
   sendButtonDisabled: { backgroundColor: '#D3D3CF' },
-  sendButtonText: { color: '#FFFFFF', fontSize: 23, lineHeight: 25, fontWeight: '700' },
-  composerHint: { marginTop: 7, paddingHorizontal: 10, color: '#8A8A84', fontSize: 10.5, lineHeight: 14, textAlign: 'center' },
 
   pageHeader: {
     height: 62,
