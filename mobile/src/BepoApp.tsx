@@ -422,7 +422,11 @@ function ChatScreen({
   return (
     <View style={styles.fill}>
       <ChatControls memoryCount={memoryCount} onOpenMemories={onOpenMemories} onOpenSettings={onOpenSettings} />
-      <KeyboardAvoidingView style={styles.fill} behavior={Platform.OS === 'ios' ? 'padding' : undefined} keyboardVerticalOffset={0}>
+      <KeyboardAvoidingView
+        style={styles.fill}
+        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+        keyboardVerticalOffset={Platform.OS === 'ios' ? 10 : 0}
+      >
         <FlatList
           ref={listRef}
           data={messages}
