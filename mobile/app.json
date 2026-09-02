@@ -1,0 +1,60 @@
+{
+  "expo": {
+    "name": "Bepo",
+    "slug": "bepo",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/bepo-bunny-icon.png",
+    "scheme": "bepo",
+    "userInterfaceStyle": "light",
+    "splash": {
+      "image": "./assets/bepo-bunny-icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#F5F0E8"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.enlorik.bepo",
+      "config": {
+        "usesNonExemptEncryption": false
+      },
+      "infoPlist": {
+        "NSCameraUsageDescription": "Bepo uses the camera when you choose to capture a new memory.",
+        "NSPhotoLibraryUsageDescription": "Bepo lets you choose photos to save as memories.",
+        "NSLocationWhenInUseUsageDescription": "Bepo can attach your current location to a memory when you ask it to."
+      }
+    },
+    "android": {
+      "package": "com.enlorik.bepo",
+      "blockedPermissions": [
+        "android.permission.RECORD_AUDIO"
+      ],
+      "adaptiveIcon": {
+        "backgroundColor": "#F5F0E8",
+        "foregroundImage": "./assets/bepo-bunny-icon.png"
+      },
+      "predictiveBackGestureEnabled": false
+    },
+    "plugins": [
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Bepo lets you choose photos to save as memories.",
+          "cameraPermission": "Bepo uses the camera when you choose to capture a new memory.",
+          "microphonePermission": false
+        }
+      ],
+      [
+        "expo-location",
+        {
+          "locationWhenInUsePermission": "Bepo can attach your current location to a memory when you ask it to."
+        }
+      ],
+      "expo-secure-store"
+    ],
+    "platforms": [
+      "ios",
+      "android"
+    ]
+  }
+}

@@ -15,6 +15,12 @@ A Python FastAPI application for storing and searching memories with images, tex
 - **SQLite Storage**: Local database with efficient BLOB storage for embeddings
 - **Image Storage**: Saves uploaded images to the local filesystem or an attached Railway volume
 
+## Mobile app (iOS and Android)
+
+Bepo now includes a native Expo/React Native client in [`mobile/`](mobile/). It uses the phone camera/photo library, optional GPS, and secure on-device key storage while keeping the existing Railway service as its private backend.
+
+For the quickest iPhone test, install Expo Go, run `npx expo start --tunnel` from `mobile/`, and scan the displayed QR code. See [`mobile/README.md`](mobile/README.md) for the testing and TestFlight paths.
+
 > **Note:** `memories.db` and the `images/` directory are runtime data and are excluded from version control via `.gitignore`. When Railway attaches a volume, Bepo automatically stores both on that persistent volume.
 
 ## Installation
