@@ -141,8 +141,10 @@ export const styles = StyleSheet.create({
     alignItems: 'flex-end',
     backgroundColor: palette.background,
   },
-  addButton: { width: 40, height: 40, borderRadius: 20, alignItems: 'center', justifyContent: 'center' },
-  addButtonText: { color: palette.text, fontSize: 27, lineHeight: 29, fontWeight: '300' },
+  composerTools: { flexDirection: 'row', alignItems: 'center', gap: 2, marginLeft: 2, marginRight: 3 },
+  composerToolButton: { minWidth: 42, height: 40, paddingHorizontal: 3, borderRadius: 14, alignItems: 'center', justifyContent: 'center' },
+  composerToolGlyph: { color: palette.text, fontSize: 18, lineHeight: 19 },
+  composerToolLabel: { marginTop: 1, color: palette.muted, fontSize: 8, lineHeight: 9, fontWeight: '600' },
   composerInput: {
     flex: 1,
     minHeight: 40,

@@ -5,7 +5,6 @@ import * as SecureStore from 'expo-secure-store';
 import { StatusBar } from 'expo-status-bar';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
-  ActionSheetIOS,
   ActivityIndicator,
   Alert,
   FlatList,
@@ -333,28 +332,6 @@ function ChatScreen({
     }
   }
 
-  function openAttachmentMenu() {
-    if (Platform.OS === 'ios') {
-      ActionSheetIOS.showActionSheetWithOptions(
-        {
-          title: 'Share a memory with Bepo',
-          options: ['Take Photo', 'Choose from Library', 'Cancel'],
-          cancelButtonIndex: 2,
-        },
-        (index) => {
-          if (index === 0) choosePhoto('camera');
-          if (index === 1) choosePhoto('library');
-        },
-      );
-      return;
-    }
-    Alert.alert('Share a memory with Bepo', undefined, [
-      { text: 'Take photo', onPress: () => choosePhoto('camera') },
-      { text: 'Choose from library', onPress: () => choosePhoto('library') },
-      { text: 'Cancel', style: 'cancel' },
-    ]);
-  }
-
   async function getAutomaticLocation(): Promise<Coordinates | null> {
     try {
       let permission = await Location.getForegroundPermissionsAsync();
@@ -470,9 +447,16 @@ function ChatScreen({
             </View>
           ) : null}
           <View style={styles.composer}>
-            <Pressable accessibilityLabel="Add a photo" style={styles.addButton} onPress={openAttachmentMenu}>
-              <Text style={styles.addButtonText}>＋</Text>
-            </Pressable>
+            <View style={styles.composerTools}>
+              <Pressable accessibilityLabel="Take a photo" style={styles.composerToolButton} onPress={() => choosePhoto('camera')}>
+                <Text style={styles.composerToolGlyph}>◎</Text>
+                <Text style={styles.composerToolLabel}>Camera</Text>
+              </Pressable>
+              <Pressable accessibilityLabel="Choose from photos" style={styles.composerToolButton} onPress={() => choosePhoto('library')}>
+                <Text style={styles.composerToolGlyph}>▧</Text>
+                <Text style={styles.composerToolLabel}>Photos</Text>
+              </Pressable>
+            </View>
             <TextInput
               style={styles.composerInput}
               value={draft}
@@ -491,7 +475,7 @@ function ChatScreen({
             </Pressable>
           </View>
           <Text style={styles.composerHint}>
-            {pendingPhoto ? 'This photo will become a memory.' : 'Attach a photo to remember it. Text alone asks a question.'}
+            {pendingPhoto ? 'This photo will become a memory.' : 'A photo becomes a memory. Text alone asks a question.'}
           </Text>
         </View>
       </KeyboardAvoidingView>
