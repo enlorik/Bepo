@@ -1,10 +1,11 @@
-import { StatusBar } from 'expo-status-bar';
 import { File } from 'expo-file-system';
 import * as ImagePicker from 'expo-image-picker';
 import * as Location from 'expo-location';
 import * as SecureStore from 'expo-secure-store';
-import React, { useCallback, useEffect, useState } from 'react';
+import { StatusBar } from 'expo-status-bar';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
+  ActionSheetIOS,
   ActivityIndicator,
   Alert,
   FlatList,
@@ -25,7 +26,7 @@ const DEFAULT_API_URL = 'https://bepo-production.up.railway.app';
 const KEY_STORAGE_NAME = 'bepo_api_key';
 const URL_STORAGE_NAME = 'bepo_api_url';
 
-type Screen = 'home' | 'add' | 'search' | 'ask' | 'settings';
+type Screen = 'chat' | 'memories' | 'settings';
 
 type Memory = {
   id: number;
@@ -44,16 +45,19 @@ type Memory = {
 };
 
 type ChatResponse = { status: string; answer: string; memories: Memory[] };
-type SearchResponse = { status: string; matches: Memory[] };
 type Requester = (path: string, options?: RequestInit) => Promise<any>;
 
-const tabs: Array<{ id: Screen; label: string; glyph: string }> = [
-  { id: 'home', label: 'Memories', glyph: '◫' },
-  { id: 'add', label: 'Add', glyph: '+' },
-  { id: 'search', label: 'Search', glyph: '⌕' },
-  { id: 'ask', label: 'Ask', glyph: '✦' },
-  { id: 'settings', label: 'Settings', glyph: '⚙' },
-];
+type ChatMessage = {
+  id: string;
+  role: 'user' | 'assistant';
+  text: string;
+  photoUri?: string;
+  memories?: Memory[];
+  meta?: string;
+  error?: boolean;
+};
+
+type Coordinates = { lat: number; lon: number };
 
 function cleanUrl(value: string) {
   return value.trim().replace(/\/+$/, '');
@@ -80,8 +84,12 @@ function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : 'Something went wrong. Please try again.';
 }
 
+function messageId(prefix: string) {
+  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
 export default function BepoApp() {
-  const [screen, setScreen] = useState<Screen>('home');
+  const [screen, setScreen] = useState<Screen>('chat');
   const [apiUrl, setApiUrl] = useState(DEFAULT_API_URL);
   const [apiKey, setApiKey] = useState('');
   const [draftUrl, setDraftUrl] = useState(DEFAULT_API_URL);
@@ -188,7 +196,7 @@ export default function BepoApp() {
       setApiKey(nextKey);
       setDraftUrl(nextUrl);
       setDraftKey(nextKey);
-      setScreen('home');
+      setScreen('chat');
     } catch (error) {
       setConnectionError(errorMessage(error));
     } finally {
@@ -200,8 +208,8 @@ export default function BepoApp() {
     return (
       <View style={styles.centeredPage}>
         <StatusBar style="dark" />
-        <BrandMark />
-        <ActivityIndicator color="#715840" style={{ marginTop: 20 }} />
+        <BrandMark size={72} />
+        <ActivityIndicator color="#262624" style={styles.loadingMark} />
       </View>
     );
   }
@@ -211,11 +219,11 @@ export default function BepoApp() {
       <KeyboardAvoidingView style={styles.setupPage} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
         <StatusBar style="dark" />
         <ScrollView contentContainerStyle={styles.setupContent} keyboardShouldPersistTaps="handled">
-          <BrandMark />
-          <Text style={styles.setupEyebrow}>YOUR PRIVATE MEMORY SPACE</Text>
+          <BrandMark size={72} />
+          <Text style={styles.setupEyebrow}>YOUR PRIVATE MEMORY COMPANION</Text>
           <Text style={styles.setupTitle}>Meet Bepo.</Text>
           <Text style={styles.setupCopy}>
-            Your Bepo server is already online. Connect this phone once and your key stays protected on this device.
+            Send Bepo a photo to remember it, or ask a question about the moments you have saved.
           </Text>
           <ConnectionForm
             url={draftUrl}
@@ -235,115 +243,77 @@ export default function BepoApp() {
     <View style={styles.app}>
       <StatusBar style="dark" />
       <View style={styles.safeTop} />
-      <View style={styles.page}>
-        {screen === 'home' && (
-          <HomeScreen
-            memories={memories}
-            apiUrl={apiUrl}
-            apiKey={apiKey}
-            loading={loadingMemories}
-            refreshing={refreshing}
-            onRefresh={() => { setRefreshing(true); loadMemories(true); }}
-            onAdd={() => setScreen('add')}
-          />
-        )}
-        {screen === 'add' && (
-          <AddScreen request={request} onSaved={async () => { await loadMemories(true); setScreen('home'); }} />
-        )}
-        {screen === 'search' && <SearchScreen request={request} apiUrl={apiUrl} apiKey={apiKey} />}
-        {screen === 'ask' && <AskScreen request={request} apiUrl={apiUrl} apiKey={apiKey} />}
-        {screen === 'settings' && (
-          <SettingsScreen
-            url={draftUrl}
-            setUrl={setDraftUrl}
-            apiKey={draftKey}
-            setApiKey={setDraftKey}
-            error={connectionError}
-            loading={connecting}
-            onSave={saveConnection}
-          />
-        )}
-      </View>
-      <View style={styles.tabBar}>
-        {tabs.map((tab) => (
-          <Pressable key={tab.id} style={styles.tab} onPress={() => setScreen(tab.id)}>
-            <Text style={[styles.tabGlyph, screen === tab.id && styles.tabGlyphActive]}>{tab.glyph}</Text>
-            <Text style={[styles.tabLabel, screen === tab.id && styles.tabLabelActive]}>{tab.label}</Text>
-          </Pressable>
-        ))}
-      </View>
+      {screen === 'chat' ? (
+        <ChatScreen
+          request={request}
+          apiUrl={apiUrl}
+          apiKey={apiKey}
+          memoryCount={memories.length}
+          onMemorySaved={() => loadMemories(true)}
+          onOpenMemories={() => setScreen('memories')}
+          onOpenSettings={() => setScreen('settings')}
+        />
+      ) : null}
+      {screen === 'memories' ? (
+        <MemoriesScreen
+          memories={memories}
+          apiUrl={apiUrl}
+          apiKey={apiKey}
+          loading={loadingMemories}
+          refreshing={refreshing}
+          onRefresh={() => {
+            setRefreshing(true);
+            loadMemories(true);
+          }}
+          onBack={() => setScreen('chat')}
+        />
+      ) : null}
+      {screen === 'settings' ? (
+        <SettingsScreen
+          url={draftUrl}
+          setUrl={setDraftUrl}
+          apiKey={draftKey}
+          setApiKey={setDraftKey}
+          error={connectionError}
+          loading={connecting}
+          onSave={saveConnection}
+          onBack={() => setScreen('chat')}
+        />
+      ) : null}
     </View>
   );
 }
 
-function BrandMark() {
-  return <Image source={require('../assets/bepo-bunny-icon.png')} style={styles.brandMarkImage} />;
-}
-
-function Header({ eyebrow, title, subtitle }: { eyebrow: string; title: string; subtitle?: string }) {
-  return (
-    <View style={styles.header}>
-      <Text style={styles.eyebrow}>{eyebrow}</Text>
-      <Text style={styles.title}>{title}</Text>
-      {subtitle ? <Text style={styles.subtitle}>{subtitle}</Text> : null}
-    </View>
-  );
-}
-
-function HomeScreen({ memories, apiUrl, apiKey, loading, refreshing, onRefresh, onAdd }: {
-  memories: Memory[]; apiUrl: string; apiKey: string; loading: boolean; refreshing: boolean; onRefresh: () => void; onAdd: () => void;
+function ChatScreen({
+  request,
+  apiUrl,
+  apiKey,
+  memoryCount,
+  onMemorySaved,
+  onOpenMemories,
+  onOpenSettings,
+}: {
+  request: Requester;
+  apiUrl: string;
+  apiKey: string;
+  memoryCount: number;
+  onMemorySaved: () => Promise<void>;
+  onOpenMemories: () => void;
+  onOpenSettings: () => void;
 }) {
-  return (
-    <View style={styles.fill}>
-      <FlatList
-        data={memories}
-        keyExtractor={(item) => String(item.id)}
-        contentContainerStyle={memories.length ? styles.listContent : styles.emptyListContent}
-        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor="#715840" />}
-        ListHeaderComponent={<Header eyebrow="BEPO" title="Your memories" subtitle={memories.length ? `${memories.length} saved moment${memories.length === 1 ? '' : 's'}` : undefined} />}
-        ListEmptyComponent={loading ? <ActivityIndicator color="#715840" /> : (
-          <View style={styles.emptyCard}>
-            <Text style={styles.emptyGlyph}>✦</Text>
-            <Text style={styles.emptyTitle}>Start with one moment.</Text>
-            <Text style={styles.emptyCopy}>Choose a photo, add what you remember, and Bepo will keep it close.</Text>
-            <PrimaryButton label="Add your first memory" onPress={onAdd} />
-          </View>
-        )}
-        renderItem={({ item }) => <MemoryCard memory={item} apiUrl={apiUrl} apiKey={apiKey} />}
-      />
-    </View>
-  );
-}
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [draft, setDraft] = useState('');
+  const [pendingPhoto, setPendingPhoto] = useState<ImagePicker.ImagePickerAsset | null>(null);
+  const [sending, setSending] = useState(false);
+  const listRef = useRef<FlatList<ChatMessage>>(null);
 
-function MemoryCard({ memory, apiUrl, apiKey }: { memory: Memory; apiUrl: string; apiKey: string }) {
-  const description = memory.bepo_summary || memory.user_note || memory.note || 'A saved moment';
-  return (
-    <View style={styles.memoryCard}>
-      <Image source={{ uri: absoluteUrl(apiUrl, memory.image_url), headers: { 'X-API-Key': apiKey } }} style={styles.memoryImage} resizeMode="cover" />
-      <View style={styles.memoryBody}>
-        <View style={styles.memoryMetaRow}>
-          <Text style={styles.memoryDate}>{formatDate(memory.timestamp)}</Text>
-          {memory.mood ? <Text style={styles.pill}>{memory.mood}</Text> : null}
-        </View>
-        <Text style={styles.memoryDescription}>{description}</Text>
-        {memory.tags ? <Text style={styles.memoryTags}>{memory.tags}</Text> : null}
-        {memory.place_hint ? <Text style={styles.memoryPlace}>⌖ {memory.place_hint}</Text> : null}
-        {memory.map_url ? <Pressable onPress={() => Linking.openURL(memory.map_url!)}><Text style={styles.mapLink}>Open location ↗</Text></Pressable> : null}
-        {typeof memory.score === 'number' ? <Text style={styles.score}>Match {Math.round(memory.score * 100)}%</Text> : null}
-      </View>
-    </View>
-  );
-}
+  function addMessage(message: ChatMessage) {
+    setMessages((current) => [...current, message]);
+  }
 
-function AddScreen({ request, onSaved }: { request: Requester; onSaved: () => void }) {
-  const [photo, setPhoto] = useState<ImagePicker.ImagePickerAsset | null>(null);
-  const [note, setNote] = useState('');
-  const [tags, setTags] = useState('');
-  const [mood, setMood] = useState('');
-  const [placeHint, setPlaceHint] = useState('');
-  const [coords, setCoords] = useState<{ lat: number; lon: number } | null>(null);
-  const [locating, setLocating] = useState(false);
-  const [saving, setSaving] = useState(false);
+  function updateMessage(id: string, patch: Partial<ChatMessage>) {
+    setMessages((current) => current.map((message) => (message.id === id ? { ...message, ...patch } : message)));
+  }
 
   async function choosePhoto(source: 'camera' | 'library') {
     try {
@@ -351,202 +321,381 @@ function AddScreen({ request, onSaved }: { request: Requester; onSaved: () => vo
         ? await ImagePicker.requestCameraPermissionsAsync()
         : await ImagePicker.requestMediaLibraryPermissionsAsync();
       if (!permission.granted) {
-        Alert.alert('Permission needed', `Allow ${source === 'camera' ? 'camera' : 'photo'} access to save this memory.`);
+        Alert.alert('Permission needed', `Allow ${source === 'camera' ? 'camera' : 'photo'} access to share a memory with Bepo.`);
         return;
       }
       const result = source === 'camera'
         ? await ImagePicker.launchCameraAsync({ mediaTypes: ['images'], quality: 0.85 })
         : await ImagePicker.launchImageLibraryAsync({ mediaTypes: ['images'], quality: 0.85 });
-      if (!result.canceled && result.assets[0]) setPhoto(result.assets[0]);
+      if (!result.canceled && result.assets[0]) setPendingPhoto(result.assets[0]);
     } catch (error) {
       Alert.alert('Could not open photos', errorMessage(error));
     }
   }
 
-  async function useLocation() {
-    setLocating(true);
-    try {
-      const permission = await Location.requestForegroundPermissionsAsync();
-      if (!permission.granted) {
-        Alert.alert('Location permission needed', 'Allow location access to attach where this memory happened.');
-        return;
-      }
-      const current = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced });
-      setCoords({ lat: current.coords.latitude, lon: current.coords.longitude });
-    } catch (error) {
-      Alert.alert('Could not get location', errorMessage(error));
-    } finally {
-      setLocating(false);
-    }
-  }
-
-  async function save() {
-    if (!photo) {
-      Alert.alert('Choose a photo', 'Every Bepo memory starts with a photo.');
+  function openAttachmentMenu() {
+    if (Platform.OS === 'ios') {
+      ActionSheetIOS.showActionSheetWithOptions(
+        {
+          title: 'Share a memory with Bepo',
+          options: ['Take Photo', 'Choose from Library', 'Cancel'],
+          cancelButtonIndex: 2,
+        },
+        (index) => {
+          if (index === 0) choosePhoto('camera');
+          if (index === 1) choosePhoto('library');
+        },
+      );
       return;
     }
-    setSaving(true);
+    Alert.alert('Share a memory with Bepo', undefined, [
+      { text: 'Take photo', onPress: () => choosePhoto('camera') },
+      { text: 'Choose from library', onPress: () => choosePhoto('library') },
+      { text: 'Cancel', style: 'cancel' },
+    ]);
+  }
+
+  async function getAutomaticLocation(): Promise<Coordinates | null> {
     try {
-      const form = new FormData();
-      const photoFile = new File(photo.uri);
-      form.append('photo', photoFile, photo.fileName || photoFile.name || `bepo-${Date.now()}.jpg`);
-      if (note.trim()) form.append('note', note.trim());
-      if (tags.trim()) form.append('tags', tags.trim());
-      if (mood.trim()) form.append('mood', mood.trim());
-      if (placeHint.trim()) form.append('place_hint', placeHint.trim());
-      if (coords) {
-        form.append('lat', String(coords.lat));
-        form.append('lon', String(coords.lon));
+      let permission = await Location.getForegroundPermissionsAsync();
+      if (!permission.granted && permission.canAskAgain) {
+        permission = await Location.requestForegroundPermissionsAsync();
       }
-      await request('/memory', { method: 'POST', body: form });
-      Alert.alert('Memory saved', 'Bepo will keep this one close.', [{ text: 'Done', onPress: onSaved }]);
-    } catch (error) {
-      Alert.alert('Could not save memory', errorMessage(error));
-    } finally {
-      setSaving(false);
+      if (!permission.granted) return null;
+      const cached = await Location.getLastKnownPositionAsync({
+        maxAge: 5 * 60 * 1000,
+        requiredAccuracy: 1000,
+      });
+      const location = cached ?? await Location.getCurrentPositionAsync({
+        accuracy: Location.Accuracy.Balanced,
+      });
+      return { lat: location.coords.latitude, lon: location.coords.longitude };
+    } catch {
+      return null;
     }
   }
 
-  return (
-    <KeyboardAvoidingView style={styles.fill} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
-      <ScrollView contentContainerStyle={styles.scrollContent} keyboardShouldPersistTaps="handled">
-        <Header eyebrow="CAPTURE" title="Save a moment" subtitle="A photo is enough. Add details if they matter." />
-        {photo ? (
-          <Pressable onPress={() => choosePhoto('library')}>
-            <Image source={{ uri: photo.uri }} style={styles.photoPreview} />
-            <Text style={styles.changePhoto}>Tap to choose a different photo</Text>
-          </Pressable>
-        ) : (
-          <View style={styles.photoChooser}>
-            <Text style={styles.photoGlyph}>▧</Text>
-            <Text style={styles.photoTitle}>Choose the moment</Text>
-            <View style={styles.buttonRow}>
-              <SecondaryButton label="Take photo" onPress={() => choosePhoto('camera')} />
-              <SecondaryButton label="Photo library" onPress={() => choosePhoto('library')} />
-            </View>
-          </View>
-        )}
-        <Field label="What do you remember?" value={note} onChangeText={setNote} multiline placeholder="The light, the people, how it felt…" />
-        <View style={styles.twoColumns}>
-          <View style={styles.column}><Field label="Mood" value={mood} onChangeText={setMood} placeholder="calm" /></View>
-          <View style={styles.column}><Field label="Tags" value={tags} onChangeText={setTags} placeholder="trip, summer" /></View>
-        </View>
-        <Field label="Place hint" value={placeHint} onChangeText={setPlaceHint} placeholder="near the old window" />
-        <Pressable style={styles.locationButton} onPress={useLocation} disabled={locating}>
-          <Text style={styles.locationButtonText}>{locating ? 'Finding location…' : coords ? '✓ Current location attached' : '⌖ Attach current location'}</Text>
-        </Pressable>
-        <PrimaryButton label={saving ? 'Saving…' : 'Save memory'} onPress={save} disabled={saving} />
-      </ScrollView>
-    </KeyboardAvoidingView>
-  );
-}
+  async function sendMessage(textOverride?: string) {
+    const text = (textOverride ?? draft).trim();
+    const photo = pendingPhoto;
+    if (sending || (!text && !photo)) return;
 
-function SearchScreen({ request, apiUrl, apiKey }: { request: Requester; apiUrl: string; apiKey: string }) {
-  const [query, setQuery] = useState('');
-  const [results, setResults] = useState<Memory[]>([]);
-  const [searched, setSearched] = useState(false);
-  const [loading, setLoading] = useState(false);
+    const userId = messageId('user');
+    addMessage({
+      id: userId,
+      role: 'user',
+      text: text || 'Remember this.',
+      photoUri: photo?.uri,
+      meta: photo ? 'Saving memory…' : undefined,
+    });
+    if (textOverride === undefined) setDraft('');
+    setPendingPhoto(null);
+    setSending(true);
 
-  async function search() {
-    if (!query.trim()) return;
-    setLoading(true);
     try {
-      const form = new FormData();
-      form.append('query', query.trim());
-      form.append('top_k', '10');
-      const response = (await request('/search', { method: 'POST', body: form })) as SearchResponse;
-      setResults(response.matches || []);
-      setSearched(true);
+      if (photo) {
+        const coordinates = await getAutomaticLocation();
+        const form = new FormData();
+        const photoFile = new File(photo.uri);
+        form.append('photo', photoFile, photo.fileName || photoFile.name || `bepo-${Date.now()}.jpg`);
+        if (text) form.append('note', text);
+        if (coordinates) {
+          form.append('lat', String(coordinates.lat));
+          form.append('lon', String(coordinates.lon));
+        }
+        await request('/memory', { method: 'POST', body: form });
+        updateMessage(userId, { meta: coordinates ? 'Saved with location' : 'Saved' });
+        addMessage({
+          id: messageId('bepo'),
+          role: 'assistant',
+          text: coordinates
+            ? 'It’s safe with me. I saved the moment, the time, and where you were.'
+            : 'It’s safe with me. I saved the moment and the time. Location wasn’t available this time.',
+        });
+        await onMemorySaved();
+      } else {
+        const response = (await request('/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ message: text, top_k: 3 }),
+        })) as ChatResponse;
+        addMessage({
+          id: messageId('bepo'),
+          role: 'assistant',
+          text: response.answer,
+          memories: response.memories || [],
+        });
+      }
     } catch (error) {
-      Alert.alert('Search failed', errorMessage(error));
+      if (photo) updateMessage(userId, { meta: 'Couldn’t save' });
+      addMessage({
+        id: messageId('error'),
+        role: 'assistant',
+        text: errorMessage(error),
+        error: true,
+      });
     } finally {
-      setLoading(false);
+      setSending(false);
     }
   }
+
+  const canSend = Boolean(draft.trim() || pendingPhoto) && !sending;
 
   return (
     <View style={styles.fill}>
-      <FlatList
-        data={results}
-        keyExtractor={(item) => String(item.id)}
-        contentContainerStyle={styles.listContent}
-        keyboardShouldPersistTaps="handled"
-        ListHeaderComponent={
-          <>
-            <Header eyebrow="FIND" title="Search your life" subtitle="Describe an image, a mood, a place, or a detail." />
-            <View style={styles.searchRow}>
-              <TextInput style={styles.searchInput} value={query} onChangeText={setQuery} placeholder="that quiet café…" placeholderTextColor="#9B8E81" returnKeyType="search" onSubmitEditing={search} />
-              <Pressable style={styles.searchButton} onPress={search}><Text style={styles.searchButtonText}>⌕</Text></Pressable>
+      <ChatHeader memoryCount={memoryCount} onOpenMemories={onOpenMemories} onOpenSettings={onOpenSettings} />
+      <KeyboardAvoidingView style={styles.fill} behavior={Platform.OS === 'ios' ? 'padding' : undefined} keyboardVerticalOffset={0}>
+        <FlatList
+          ref={listRef}
+          data={messages}
+          keyExtractor={(item) => item.id}
+          renderItem={({ item }) => <ChatBubble message={item} apiUrl={apiUrl} apiKey={apiKey} />}
+          keyboardShouldPersistTaps="handled"
+          contentContainerStyle={[styles.chatListContent, messages.length === 0 && styles.chatListEmpty]}
+          ListEmptyComponent={<EmptyConversation onPrompt={(prompt) => sendMessage(prompt)} />}
+          ListFooterComponent={sending ? <TypingBubble /> : <View style={styles.chatListFooter} />}
+          onContentSizeChange={() => listRef.current?.scrollToEnd({ animated: true })}
+        />
+        <View style={styles.composerArea}>
+          {pendingPhoto ? (
+            <View style={styles.attachmentPreview}>
+              <Image source={{ uri: pendingPhoto.uri }} style={styles.attachmentImage} />
+              <View style={styles.attachmentCopy}>
+                <Text style={styles.attachmentTitle}>New memory</Text>
+                <Text style={styles.attachmentMeta}>Time and location added automatically</Text>
+              </View>
+              <Pressable accessibilityLabel="Remove attached photo" style={styles.removeAttachment} onPress={() => setPendingPhoto(null)}>
+                <Text style={styles.removeAttachmentText}>×</Text>
+              </Pressable>
             </View>
-            {loading ? <ActivityIndicator color="#715840" style={{ marginVertical: 30 }} /> : null}
-            {searched && !loading && !results.length ? <NoteCard text="No matching memories yet. Try another detail." /> : null}
-          </>
-        }
+          ) : null}
+          <View style={styles.composer}>
+            <Pressable accessibilityLabel="Add a photo" style={styles.addButton} onPress={openAttachmentMenu}>
+              <Text style={styles.addButtonText}>＋</Text>
+            </Pressable>
+            <TextInput
+              style={styles.composerInput}
+              value={draft}
+              onChangeText={setDraft}
+              multiline
+              placeholder={pendingPhoto ? 'Add what you remember…' : 'Ask Bepo anything…'}
+              placeholderTextColor="#8B8B85"
+            />
+            <Pressable
+              accessibilityLabel="Send message"
+              style={[styles.sendButton, !canSend && styles.sendButtonDisabled]}
+              onPress={() => sendMessage()}
+              disabled={!canSend}
+            >
+              <Text style={styles.sendButtonText}>↑</Text>
+            </Pressable>
+          </View>
+          <Text style={styles.composerHint}>
+            {pendingPhoto ? 'This photo will become a memory.' : 'Attach a photo to remember it. Text alone asks a question.'}
+          </Text>
+        </View>
+      </KeyboardAvoidingView>
+    </View>
+  );
+}
+
+function ChatHeader({ memoryCount, onOpenMemories, onOpenSettings }: {
+  memoryCount: number;
+  onOpenMemories: () => void;
+  onOpenSettings: () => void;
+}) {
+  return (
+    <View style={styles.chatHeader}>
+      <View style={styles.headerIdentity}>
+        <BrandMark size={38} />
+        <View>
+          <Text style={styles.chatHeaderTitle}>Bepo</Text>
+          <Text style={styles.chatHeaderSubtitle}>Your private memory companion</Text>
+        </View>
+      </View>
+      <View style={styles.headerActions}>
+        <Pressable accessibilityLabel="Open memories" style={styles.headerButton} onPress={onOpenMemories}>
+          <Text style={styles.headerButtonText}>▦</Text>
+          {memoryCount ? <View style={styles.memoryBadge}><Text style={styles.memoryBadgeText}>{memoryCount > 99 ? '99+' : memoryCount}</Text></View> : null}
+        </Pressable>
+        <Pressable accessibilityLabel="Open settings" style={styles.headerButton} onPress={onOpenSettings}>
+          <Text style={styles.headerButtonText}>•••</Text>
+        </Pressable>
+      </View>
+    </View>
+  );
+}
+
+function EmptyConversation({ onPrompt }: { onPrompt: (prompt: string) => void }) {
+  const prompts = ['What do you remember most recently?', 'Where was one of my saved moments?'];
+  return (
+    <View style={styles.emptyConversation}>
+      <BrandMark size={82} />
+      <Text style={styles.emptyConversationTitle}>What can I remember for you?</Text>
+      <Text style={styles.emptyConversationCopy}>
+        Send me a photo and a few words, or ask naturally about something you have saved.
+      </Text>
+      <View style={styles.promptList}>
+        {prompts.map((prompt) => (
+          <Pressable key={prompt} style={styles.promptChip} onPress={() => onPrompt(prompt)}>
+            <Text style={styles.promptChipText}>{prompt}</Text>
+            <Text style={styles.promptArrow}>→</Text>
+          </Pressable>
+        ))}
+      </View>
+    </View>
+  );
+}
+
+function ChatBubble({ message, apiUrl, apiKey }: { message: ChatMessage; apiUrl: string; apiKey: string }) {
+  if (message.role === 'user') {
+    return (
+      <View style={styles.userMessageRow}>
+        <View style={styles.userBubble}>
+          {message.photoUri ? <Image source={{ uri: message.photoUri }} style={styles.userPhoto} /> : null}
+          <Text style={styles.userBubbleText}>{message.text}</Text>
+          {message.meta ? <Text style={styles.userBubbleMeta}>{message.meta}</Text> : null}
+        </View>
+      </View>
+    );
+  }
+  return (
+    <View style={styles.assistantRow}>
+      <BrandMark size={30} />
+      <View style={styles.assistantContent}>
+        <Text style={[styles.assistantText, message.error && styles.assistantError]}>{message.text}</Text>
+        {message.memories?.map((memory) => (
+          <MemoryCard key={memory.id} memory={memory} apiUrl={apiUrl} apiKey={apiKey} compact />
+        ))}
+      </View>
+    </View>
+  );
+}
+
+function TypingBubble() {
+  return (
+    <View style={styles.assistantRow}>
+      <BrandMark size={30} />
+      <View style={styles.typingPill}>
+        <View style={styles.typingDot} />
+        <View style={styles.typingDot} />
+        <View style={styles.typingDot} />
+      </View>
+    </View>
+  );
+}
+
+function MemoriesScreen({ memories, apiUrl, apiKey, loading, refreshing, onRefresh, onBack }: {
+  memories: Memory[];
+  apiUrl: string;
+  apiKey: string;
+  loading: boolean;
+  refreshing: boolean;
+  onRefresh: () => void;
+  onBack: () => void;
+}) {
+  return (
+    <View style={styles.fill}>
+      <PageHeader title="Memories" subtitle={`${memories.length} saved`} onBack={onBack} />
+      <FlatList
+        data={memories}
+        keyExtractor={(item) => String(item.id)}
+        contentContainerStyle={[styles.memoryList, memories.length === 0 && styles.memoryListEmpty]}
+        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor="#262624" />}
+        ListEmptyComponent={loading ? <ActivityIndicator color="#262624" /> : (
+          <View style={styles.galleryEmpty}>
+            <BrandMark size={64} />
+            <Text style={styles.galleryEmptyTitle}>No memories yet</Text>
+            <Text style={styles.galleryEmptyCopy}>Go back to the conversation and attach your first photo.</Text>
+          </View>
+        )}
         renderItem={({ item }) => <MemoryCard memory={item} apiUrl={apiUrl} apiKey={apiKey} />}
       />
     </View>
   );
 }
 
-function AskScreen({ request, apiUrl, apiKey }: { request: Requester; apiUrl: string; apiKey: string }) {
-  const [message, setMessage] = useState('');
-  const [answer, setAnswer] = useState('');
-  const [related, setRelated] = useState<Memory[]>([]);
-  const [loading, setLoading] = useState(false);
-
-  async function ask() {
-    if (!message.trim()) return;
-    setLoading(true);
-    try {
-      const response = (await request('/chat', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: message.trim(), top_k: 3 }),
-      })) as ChatResponse;
-      setAnswer(response.answer);
-      setRelated(response.memories || []);
-    } catch (error) {
-      Alert.alert('Bepo could not answer', errorMessage(error));
-    } finally {
-      setLoading(false);
-    }
-  }
-
+function MemoryCard({ memory, apiUrl, apiKey, compact = false }: {
+  memory: Memory;
+  apiUrl: string;
+  apiKey: string;
+  compact?: boolean;
+}) {
+  const description = memory.bepo_summary || memory.user_note || memory.note || 'A saved moment';
   return (
-    <KeyboardAvoidingView style={styles.fill} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
-      <ScrollView contentContainerStyle={styles.scrollContent} keyboardShouldPersistTaps="handled">
-        <Header eyebrow="RECALL" title="Ask Bepo" subtitle="Ask naturally. Bepo will look through what you saved." />
-        <View style={styles.askCard}>
-          <TextInput style={styles.askInput} value={message} onChangeText={setMessage} multiline placeholder="Where was that calm café with the cat?" placeholderTextColor="#9B8E81" />
-          <PrimaryButton label={loading ? 'Remembering…' : 'Ask Bepo'} onPress={ask} disabled={loading} />
+    <View style={[styles.memoryCard, compact && styles.inlineMemoryCard]}>
+      <Image
+        source={{ uri: absoluteUrl(apiUrl, memory.image_url), headers: { 'X-API-Key': apiKey } }}
+        style={[styles.memoryImage, compact && styles.inlineMemoryImage]}
+        resizeMode="cover"
+      />
+      <View style={styles.memoryBody}>
+        <View style={styles.memoryMetaRow}>
+          <Text style={styles.memoryDate}>{formatDate(memory.timestamp)}</Text>
+          {memory.mood ? <Text style={styles.pill}>{memory.mood}</Text> : null}
         </View>
-        {answer ? (
-          <View style={styles.answerCard}>
-            <Text style={styles.answerEyebrow}>BEPO REMEMBERS</Text>
-            <Text style={styles.answerText}>{answer}</Text>
-          </View>
+        <Text style={[styles.memoryDescription, compact && styles.inlineMemoryDescription]}>{description}</Text>
+        {memory.tags ? <Text style={styles.memoryTags}>{memory.tags}</Text> : null}
+        {memory.place_hint ? <Text style={styles.memoryPlace}>⌖ {memory.place_hint}</Text> : null}
+        {memory.map_url ? (
+          <Pressable onPress={() => Linking.openURL(memory.map_url!)}>
+            <Text style={styles.mapLink}>Open location ↗</Text>
+          </Pressable>
         ) : null}
-        {related.map((item) => <MemoryCard key={item.id} memory={item} apiUrl={apiUrl} apiKey={apiKey} />)}
-      </ScrollView>
-    </KeyboardAvoidingView>
+      </View>
+    </View>
   );
 }
 
-function SettingsScreen(props: ConnectionProps) {
+function SettingsScreen(props: ConnectionProps & { onBack: () => void }) {
+  const { onBack, ...connectionProps } = props;
   return (
-    <KeyboardAvoidingView style={styles.fill} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
-      <ScrollView contentContainerStyle={styles.scrollContent} keyboardShouldPersistTaps="handled">
-        <Header eyebrow="PRIVATE BY DEFAULT" title="Connection" subtitle="Your key is stored securely on this device and is never included in the app code." />
-        <ConnectionForm {...props} />
-        <NoteCard title="About this Bepo" text="Your photos and memories live on your private Railway service. The phone app only displays and adds to them." />
-      </ScrollView>
-    </KeyboardAvoidingView>
+    <View style={styles.fill}>
+      <PageHeader title="Settings" subtitle="Private connection" onBack={onBack} />
+      <KeyboardAvoidingView style={styles.fill} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
+        <ScrollView contentContainerStyle={styles.settingsContent} keyboardShouldPersistTaps="handled">
+          <ConnectionForm {...connectionProps} />
+          <NoteCard
+            title="Automatic location"
+            text="When you send a photo, Bepo adds your current location automatically if you allow location access. A photo can still be saved when location is unavailable."
+          />
+          <NoteCard
+            title="Private by default"
+            text="Your photos and memories live on your private Railway service. Your API key stays protected on this device."
+          />
+        </ScrollView>
+      </KeyboardAvoidingView>
+    </View>
   );
+}
+
+function PageHeader({ title, subtitle, onBack }: { title: string; subtitle: string; onBack: () => void }) {
+  return (
+    <View style={styles.pageHeader}>
+      <Pressable accessibilityLabel="Back to Bepo" style={styles.backButton} onPress={onBack}>
+        <Text style={styles.backButtonText}>‹</Text>
+      </Pressable>
+      <View style={styles.pageHeaderCopy}>
+        <Text style={styles.pageHeaderTitle}>{title}</Text>
+        <Text style={styles.pageHeaderSubtitle}>{subtitle}</Text>
+      </View>
+      <View style={styles.pageHeaderSpacer} />
+    </View>
+  );
+}
+
+function BrandMark({ size }: { size: number }) {
+  return <Image source={require('../assets/bepo-bunny-icon.png')} style={{ width: size, height: size, borderRadius: Math.round(size * 0.3) }} />;
 }
 
 type ConnectionProps = {
-  url: string; setUrl: (value: string) => void; apiKey: string; setApiKey: (value: string) => void;
-  error: string; loading: boolean; onSave: () => void;
+  url: string;
+  setUrl: (value: string) => void;
+  apiKey: string;
+  setApiKey: (value: string) => void;
+  error: string;
+  loading: boolean;
+  onSave: () => void;
 };
 
 function ConnectionForm({ url, setUrl, apiKey, setApiKey, error, loading, onSave }: ConnectionProps) {
@@ -555,29 +704,34 @@ function ConnectionForm({ url, setUrl, apiKey, setApiKey, error, loading, onSave
       <Field label="Bepo server" value={url} onChangeText={setUrl} autoCapitalize="none" keyboardType="url" />
       <Field label="Private API key" value={apiKey} onChangeText={setApiKey} autoCapitalize="none" secureTextEntry placeholder="Paste BEPO_API_KEY" />
       {error ? <Text style={styles.errorText}>{error}</Text> : null}
-      <PrimaryButton label={loading ? 'Checking…' : 'Connect securely'} onPress={onSave} disabled={loading} />
+      <PrimaryButton label={loading ? 'Checking…' : 'Save connection'} onPress={onSave} disabled={loading} />
     </View>
   );
 }
 
-function NoteCard({ title, text }: { title?: string; text: string }) {
-  return <View style={styles.noteCard}>{title ? <Text style={styles.noteCardTitle}>{title}</Text> : null}<Text style={styles.noteCardText}>{text}</Text></View>;
+function NoteCard({ title, text }: { title: string; text: string }) {
+  return (
+    <View style={styles.noteCard}>
+      <Text style={styles.noteCardTitle}>{title}</Text>
+      <Text style={styles.noteCardText}>{text}</Text>
+    </View>
+  );
 }
 
-function Field({ label, multiline, ...inputProps }: { label: string; multiline?: boolean } & React.ComponentProps<typeof TextInput>) {
+function Field({ label, ...inputProps }: { label: string } & React.ComponentProps<typeof TextInput>) {
   return (
     <View style={styles.field}>
       <Text style={styles.fieldLabel}>{label}</Text>
-      <TextInput {...inputProps} multiline={multiline} style={[styles.input, multiline && styles.multilineInput]} placeholderTextColor="#9B8E81" />
+      <TextInput {...inputProps} style={styles.input} placeholderTextColor="#8B8B85" />
     </View>
   );
 }
 
 function PrimaryButton({ label, onPress, disabled = false }: { label: string; onPress: () => void; disabled?: boolean }) {
-  return <Pressable style={[styles.primaryButton, disabled && styles.disabledButton]} onPress={onPress} disabled={disabled}><Text style={styles.primaryButtonText}>{label}</Text></Pressable>;
-}
-
-function SecondaryButton({ label, onPress }: { label: string; onPress: () => void }) {
-  return <Pressable style={styles.secondaryButton} onPress={onPress}><Text style={styles.secondaryButtonText}>{label}</Text></Pressable>;
+  return (
+    <Pressable style={[styles.primaryButton, disabled && styles.disabledButton]} onPress={onPress} disabled={disabled}>
+      <Text style={styles.primaryButtonText}>{label}</Text>
+    </Pressable>
+  );
 }
 
