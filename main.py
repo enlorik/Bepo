@@ -137,12 +137,17 @@ def init_db():
         CREATE TABLE IF NOT EXISTS memories (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             ts DATETIME NOT NULL,
+            taken_at DATETIME,
+            taken_at_source TEXT,
             lat REAL,
             lon REAL,
+            location_source TEXT,
             image_path TEXT NOT NULL,
             image_emb BLOB NOT NULL,
             text_note TEXT,
-            text_emb BLOB
+            text_emb BLOB,
+            note_created_at DATETIME,
+            note_updated_at DATETIME
         )
     """)
 
@@ -155,10 +160,24 @@ def init_db():
         "tags": "ALTER TABLE memories ADD COLUMN tags TEXT",
         "mood": "ALTER TABLE memories ADD COLUMN mood TEXT",
         "place_hint": "ALTER TABLE memories ADD COLUMN place_hint TEXT",
+        "taken_at": "ALTER TABLE memories ADD COLUMN taken_at DATETIME",
+        "taken_at_source": "ALTER TABLE memories ADD COLUMN taken_at_source TEXT",
+        "location_source": "ALTER TABLE memories ADD COLUMN location_source TEXT",
+        "note_created_at": "ALTER TABLE memories ADD COLUMN note_created_at DATETIME",
+        "note_updated_at": "ALTER TABLE memories ADD COLUMN note_updated_at DATETIME",
     }
     for column, statement in migration_alter_statements.items():
         if column not in existing_columns:
             cursor.execute(statement)
+
+    # Existing notes were written when their memory was first added. Preserve
+    # that useful history while leaving the unknown event date untouched.
+    cursor.execute("""
+        UPDATE memories
+        SET note_created_at = ts, note_updated_at = ts
+        WHERE note_created_at IS NULL
+          AND (TRIM(COALESCE(text_note, '')) <> '' OR TRIM(COALESCE(user_note, '')) <> '')
+    """)
     
     conn.commit()
     conn.close()
@@ -322,6 +341,11 @@ def row_to_memory_response(row: sqlite3.Row) -> dict:
     return {
         "id": memory_id,
         "timestamp": row["ts"],
+        "added_at": row["ts"],
+        "taken_at": row["taken_at"],
+        "taken_at_source": row["taken_at_source"],
+        "note_created_at": row["note_created_at"],
+        "note_updated_at": row["note_updated_at"],
         "note": row["text_note"],
         "user_note": row["user_note"],
         "bepo_summary": row["bepo_summary"],
@@ -330,6 +354,7 @@ def row_to_memory_response(row: sqlite3.Row) -> dict:
         "place_hint": row["place_hint"],
         "lat": lat,
         "lon": lon,
+        "location_source": row["location_source"],
         "image_path": row["image_path"],
         "image_url": build_image_url(memory_id),
         "map_url": build_map_url(lat, lon),
@@ -356,7 +381,8 @@ def fetch_memory_by_id(memory_id: int) -> Optional[sqlite3.Row]:
     try:
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT id, ts, lat, lon, image_path, image_emb, text_note, text_emb, "
+            "SELECT id, ts, taken_at, taken_at_source, lat, lon, location_source, "
+            "image_path, image_emb, text_note, text_emb, note_created_at, note_updated_at, "
             "user_note, bepo_summary, tags, mood, place_hint "
             "FROM memories WHERE id = ?",
             (memory_id,),
@@ -372,6 +398,38 @@ def build_combined_text(*fields: Optional[str]) -> Optional[str]:
     if not parts:
         return None
     return "\n".join(parts)
+
+
+def normalize_datetime_value(value: Optional[str], field_name: str) -> Optional[str]:
+    """Validate an optional ISO date/time while preserving its supplied timezone."""
+    if value is None or not value.strip():
+        return None
+    cleaned = value.strip()
+    try:
+        parsed = datetime.fromisoformat(cleaned.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=f"{field_name} must be an ISO date or date-time") from exc
+    return parsed.isoformat()
+
+
+def datetime_search_text(value: Optional[str]) -> Optional[str]:
+    """Turn a stored date into useful searchable year/month/day words."""
+    if value is None:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return value
+    return parsed.strftime("%Y %B %d")
+
+
+def friendly_memory_date(value: str) -> str:
+    """Return a compact human date for Bepo's conversational answer."""
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return value
+    return parsed.strftime("%B %d, %Y").replace(" 0", " ")
 
 
 def cosine_similarity(vec1: np.ndarray, vec2: np.ndarray) -> float:
@@ -410,7 +468,8 @@ def search_memory_matches(query: str, top_k: int) -> list:
     try:
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT id, ts, lat, lon, image_path, image_emb, text_note, text_emb, "
+            "SELECT id, ts, taken_at, taken_at_source, lat, lon, location_source, "
+            "image_path, image_emb, text_note, text_emb, note_created_at, note_updated_at, "
             "user_note, bepo_summary, tags, mood, place_hint "
             "FROM memories"
         )
@@ -438,6 +497,11 @@ def search_memory_matches(query: str, top_k: int) -> list:
         scored.append({
             "id": memory_id,
             "timestamp": row["ts"],
+            "added_at": row["ts"],
+            "taken_at": row["taken_at"],
+            "taken_at_source": row["taken_at_source"],
+            "note_created_at": row["note_created_at"],
+            "note_updated_at": row["note_updated_at"],
             "image_path": row["image_path"],
             "image_url": build_image_url(memory_id),
             "note": row["text_note"],
@@ -448,6 +512,7 @@ def search_memory_matches(query: str, top_k: int) -> list:
             "place_hint": row["place_hint"],
             "lat": lat,
             "lon": lon,
+            "location_source": row["location_source"],
             "map_url": build_map_url(lat, lon),
             "score": score,
         })
@@ -468,6 +533,9 @@ def build_chat_answer(top: dict) -> str:
     description = top.get("bepo_summary") or top.get("user_note") or top.get("note")
     if description:
         sentences.append(f'I recall: "{description}".')
+
+    if top.get("taken_at"):
+        sentences.append(f"The photo was taken on {friendly_memory_date(top['taken_at'])}.")
 
     details = []
     if top.get("mood"):
@@ -491,8 +559,11 @@ async def create_memory(
     tags: Optional[str] = Form(None),
     mood: Optional[str] = Form(None),
     place_hint: Optional[str] = Form(None),
+    taken_at: Optional[str] = Form(None),
+    taken_at_source: Optional[str] = Form(None),
     lat: Optional[float] = Form(None),
-    lon: Optional[float] = Form(None)
+    lon: Optional[float] = Form(None),
+    location_source: Optional[str] = Form(None),
 ):
     """
     Store a new memory with photo, optional note, and GPS coordinates.
@@ -507,8 +578,16 @@ async def create_memory(
         if image.mode != "RGB":
             image = image.convert("RGB")
         
-        # Generate unique filename
-        timestamp = datetime.now()
+        parsed_taken_at = normalize_datetime_value(taken_at, "taken_at")
+        if taken_at_source not in {None, "photo", "camera", "manual"}:
+            raise HTTPException(status_code=422, detail="taken_at_source must be photo, camera, or manual")
+        if location_source not in {None, "photo", "current", "manual"}:
+            raise HTTPException(status_code=422, detail="location_source must be photo, current, or manual")
+
+        # The server timestamp records when the memory/note was added. The
+        # optional photo timestamp records when the event itself happened.
+        timestamp = datetime.now().astimezone()
+        timestamp_iso = timestamp.isoformat()
         filename = f"{timestamp.strftime('%Y%m%d_%H%M%S_%f')}.jpg"
         image_path = os.path.join(IMAGES_DIR, filename)
         
@@ -518,9 +597,13 @@ async def create_memory(
         # Generate embeddings
         image_emb = get_image_embedding(image)
         text_emb = None
-        combined_text = build_combined_text(note, user_note, bepo_summary, tags, mood, place_hint)
+        combined_text = build_combined_text(
+            note, user_note, bepo_summary, tags, mood, place_hint,
+            datetime_search_text(parsed_taken_at),
+        )
         if combined_text is not None:
             text_emb = get_text_embedding(combined_text)
+        note_created_at = timestamp_iso if build_combined_text(note, user_note) is not None else None
         
         # Store in database
         conn = get_db_connection()
@@ -528,18 +611,24 @@ async def create_memory(
             cursor = conn.cursor()
             cursor.execute("""
                 INSERT INTO memories (
-                    ts, lat, lon, image_path, image_emb, text_note, text_emb,
+                    ts, taken_at, taken_at_source, lat, lon, location_source,
+                    image_path, image_emb, text_note, text_emb, note_created_at, note_updated_at,
                     user_note, bepo_summary, tags, mood, place_hint
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                timestamp.isoformat(),
+                timestamp_iso,
+                parsed_taken_at,
+                taken_at_source if parsed_taken_at is not None else None,
                 lat,
                 lon,
+                location_source if lat is not None and lon is not None else None,
                 image_path,
                 serialize_embedding(image_emb),
                 note,
                 serialize_embedding(text_emb) if text_emb is not None else None,
+                note_created_at,
+                note_created_at,
                 user_note,
                 bepo_summary,
                 tags,
@@ -554,7 +643,12 @@ async def create_memory(
         return {
             "status": "success",
             "memory_id": memory_id,
-            "timestamp": timestamp.isoformat(),
+            "timestamp": timestamp_iso,
+            "added_at": timestamp_iso,
+            "taken_at": parsed_taken_at,
+            "taken_at_source": taken_at_source if parsed_taken_at is not None else None,
+            "note_created_at": note_created_at,
+            "note_updated_at": note_created_at,
             "image_path": image_path,
             "image_url": build_image_url(memory_id),
             "note": note,
@@ -565,9 +659,12 @@ async def create_memory(
             "place_hint": place_hint,
             "lat": lat,
             "lon": lon,
+            "location_source": location_source if lat is not None and lon is not None else None,
             "map_url": build_map_url(lat, lon),
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error creating memory: {str(e)}")
 
@@ -590,6 +687,15 @@ async def update_memory_metadata(memory_id: int, payload: MemoryMetadataUpdate):
     }
     merged_values.update(updates)
 
+    note_created_at = existing_row["note_created_at"]
+    note_updated_at = existing_row["note_updated_at"]
+    if "text_note" in updates or "user_note" in updates:
+        note_updated_at = datetime.now().astimezone().isoformat()
+        if note_created_at is None and build_combined_text(
+            merged_values["text_note"], merged_values["user_note"]
+        ) is not None:
+            note_created_at = note_updated_at
+
     combined_text = build_combined_text(
         merged_values["text_note"],
         merged_values["user_note"],
@@ -597,6 +703,7 @@ async def update_memory_metadata(memory_id: int, payload: MemoryMetadataUpdate):
         merged_values["tags"],
         merged_values["mood"],
         merged_values["place_hint"],
+        datetime_search_text(existing_row["taken_at"]),
     )
     serialized_text_emb = None
     if combined_text is not None:
@@ -608,7 +715,8 @@ async def update_memory_metadata(memory_id: int, payload: MemoryMetadataUpdate):
         cursor.execute(
             """
             UPDATE memories
-            SET text_note = ?, user_note = ?, bepo_summary = ?, tags = ?, mood = ?, place_hint = ?, text_emb = ?
+            SET text_note = ?, user_note = ?, bepo_summary = ?, tags = ?, mood = ?, place_hint = ?,
+                text_emb = ?, note_created_at = ?, note_updated_at = ?
             WHERE id = ?
             """,
             (
@@ -619,12 +727,15 @@ async def update_memory_metadata(memory_id: int, payload: MemoryMetadataUpdate):
                 merged_values["mood"],
                 merged_values["place_hint"],
                 serialized_text_emb,
+                note_created_at,
+                note_updated_at,
                 memory_id,
             ),
         )
         conn.commit()
         cursor.execute(
-            "SELECT id, ts, lat, lon, image_path, text_note, user_note, bepo_summary, tags, mood, place_hint "
+            "SELECT id, ts, taken_at, taken_at_source, lat, lon, location_source, image_path, "
+            "text_note, note_created_at, note_updated_at, user_note, bepo_summary, tags, mood, place_hint "
             "FROM memories WHERE id = ?",
             (memory_id,),
         )
@@ -709,9 +820,9 @@ async def list_memories():
     try:
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT id, ts, lat, lon, image_path, text_note, "
-            "user_note, bepo_summary, tags, mood, place_hint "
-            "FROM memories ORDER BY ts DESC"
+            "SELECT id, ts, taken_at, taken_at_source, lat, lon, location_source, image_path, "
+            "text_note, note_created_at, note_updated_at, user_note, bepo_summary, tags, mood, place_hint "
+            "FROM memories ORDER BY COALESCE(taken_at, ts) DESC"
         )
         rows = cursor.fetchall()
     finally:
@@ -773,3 +884,4 @@ if __name__ == "__main__":
         host=os.getenv("HOST", "0.0.0.0"),
         port=int(os.getenv("PORT", "8000")),
     )
+

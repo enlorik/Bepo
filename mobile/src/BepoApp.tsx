@@ -2,6 +2,7 @@ import { File } from 'expo-file-system';
 import Ionicons from '@expo/vector-icons/Ionicons';
 import * as ImagePicker from 'expo-image-picker';
 import * as Location from 'expo-location';
+import { Asset as MediaLibraryAsset } from 'expo-media-library';
 import * as SecureStore from 'expo-secure-store';
 import { StatusBar } from 'expo-status-bar';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
@@ -31,6 +32,11 @@ type Screen = 'chat' | 'memories' | 'settings';
 type Memory = {
   id: number;
   timestamp: string;
+  added_at?: string;
+  taken_at?: string | null;
+  taken_at_source?: 'photo' | 'camera' | 'manual' | null;
+  note_created_at?: string | null;
+  note_updated_at?: string | null;
   note: string | null;
   user_note?: string | null;
   bepo_summary?: string | null;
@@ -39,6 +45,7 @@ type Memory = {
   place_hint?: string | null;
   lat: number | null;
   lon: number | null;
+  location_source?: 'photo' | 'current' | 'manual' | null;
   image_url: string;
   map_url: string | null;
   score?: number;
@@ -59,6 +66,17 @@ type ChatMessage = {
 
 type Coordinates = { lat: number; lon: number };
 
+type PendingPhoto = {
+  asset: ImagePicker.ImagePickerAsset;
+  source: 'camera' | 'library';
+  takenAt: string | null;
+  takenAtSource: 'photo' | 'camera' | null;
+  coordinates: Coordinates | null;
+  locationSource: 'photo' | 'current' | null;
+  placeLabel: string | null;
+  metadataLoading: boolean;
+};
+
 function cleanUrl(value: string) {
   return value.trim().replace(/\/+$/, '');
 }
@@ -78,6 +96,123 @@ function formatDate(value: string) {
     hour: 'numeric',
     minute: '2-digit',
   }).format(date);
+}
+
+function exifValue(exif: Record<string, any> | null | undefined, keys: string[]) {
+  if (!exif) return null;
+  for (const key of keys) {
+    if (exif[key] !== undefined && exif[key] !== null) return exif[key];
+  }
+  return null;
+}
+
+function rationalNumber(value: unknown): number | null {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  const fraction = trimmed.match(/^(-?\d+(?:\.\d+)?)\s*\/\s*(-?\d+(?:\.\d+)?)$/);
+  if (fraction) {
+    const denominator = Number(fraction[2]);
+    return denominator ? Number(fraction[1]) / denominator : null;
+  }
+  const number = Number(trimmed);
+  return Number.isFinite(number) ? number : null;
+}
+
+function exifCoordinate(value: unknown, reference: unknown): number | null {
+  let coordinate: number | null = null;
+  if (Array.isArray(value)) {
+    const parts = value.map(rationalNumber);
+    if (parts.length >= 3 && parts.every((part) => part !== null)) {
+      coordinate = parts[0]! + parts[1]! / 60 + parts[2]! / 3600;
+    }
+  } else if (typeof value === 'string' && value.includes(',')) {
+    const parts = value.split(',').map((part) => rationalNumber(part));
+    if (parts.length >= 3 && parts.every((part) => part !== null)) {
+      coordinate = parts[0]! + parts[1]! / 60 + parts[2]! / 3600;
+    }
+  } else {
+    coordinate = rationalNumber(value);
+  }
+  if (coordinate === null) return null;
+  const direction = typeof reference === 'string' ? reference.toUpperCase() : '';
+  return direction === 'S' || direction === 'W' ? -Math.abs(coordinate) : coordinate;
+}
+
+function coordinatesFromExif(exif: Record<string, any> | null | undefined): Coordinates | null {
+  const lat = exifCoordinate(
+    exifValue(exif, ['GPSLatitude', 'latitude', 'Latitude']),
+    exifValue(exif, ['GPSLatitudeRef', 'latitudeRef']),
+  );
+  const lon = exifCoordinate(
+    exifValue(exif, ['GPSLongitude', 'longitude', 'Longitude']),
+    exifValue(exif, ['GPSLongitudeRef', 'longitudeRef']),
+  );
+  if (lat === null || lon === null || Math.abs(lat) > 90 || Math.abs(lon) > 180) return null;
+  return { lat, lon };
+}
+
+function takenAtFromExif(exif: Record<string, any> | null | undefined): string | null {
+  const raw = exifValue(exif, ['DateTimeOriginal', 'DateTimeDigitized', 'DateTime', 'CreationDate']);
+  if (typeof raw !== 'string') return null;
+  const match = raw.trim().match(/^(\d{4})[:/-](\d{2})[:/-](\d{2})(?:[ T](\d{2}):(\d{2})(?::(\d{2}))?)?/);
+  if (!match) return null;
+  const [, year, month, day, hour = '00', minute = '00', second = '00'] = match;
+  return `${year}-${month}-${day}T${hour}:${minute}:${second}`;
+}
+
+async function placeNameForCoordinates(coordinates: Coordinates): Promise<string | null> {
+  try {
+    const [place] = await Location.reverseGeocodeAsync({
+      latitude: coordinates.lat,
+      longitude: coordinates.lon,
+    });
+    if (!place) return null;
+    const parts = [place.city || place.district || place.subregion, place.region, place.country].filter(Boolean);
+    return [...new Set(parts)].slice(0, 2).join(', ') || null;
+  } catch {
+    return null;
+  }
+}
+
+async function readLibraryPhotoHistory(asset: ImagePicker.ImagePickerAsset) {
+  let takenAt = takenAtFromExif(asset.exif);
+  let coordinates = coordinatesFromExif(asset.exif);
+
+  if (asset.assetId) {
+    try {
+      const libraryAsset = new MediaLibraryAsset(asset.assetId);
+      const [creationResult, locationResult] = await Promise.allSettled([
+        libraryAsset.getCreationTime(),
+        libraryAsset.getLocation(),
+      ]);
+      if (!takenAt && creationResult.status === 'fulfilled' && creationResult.value) {
+        takenAt = new Date(creationResult.value).toISOString();
+      }
+      if (!coordinates && locationResult.status === 'fulfilled' && locationResult.value) {
+        coordinates = { lat: locationResult.value.latitude, lon: locationResult.value.longitude };
+      }
+    } catch {
+      // EXIF may still have supplied either value; unavailable library details are okay.
+    }
+  }
+
+  return {
+    takenAt,
+    coordinates,
+    placeLabel: coordinates ? await placeNameForCoordinates(coordinates) : null,
+  };
+}
+
+function memoryHistoryText(memory: Memory) {
+  const addedAt = memory.added_at || memory.timestamp;
+  const noteAt = memory.note_created_at;
+  if (noteAt && Math.abs(new Date(noteAt).getTime() - new Date(addedAt).getTime()) < 60_000) {
+    return `Added with note ${formatDate(addedAt)}`;
+  }
+  return [`Added ${formatDate(addedAt)}`, noteAt ? `Note written ${formatDate(noteAt)}` : null]
+    .filter(Boolean)
+    .join(' · ');
 }
 
 function errorMessage(error: unknown) {
@@ -303,7 +438,7 @@ function ChatScreen({
 }) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [draft, setDraft] = useState('');
-  const [pendingPhoto, setPendingPhoto] = useState<ImagePicker.ImagePickerAsset | null>(null);
+  const [pendingPhoto, setPendingPhoto] = useState<PendingPhoto | null>(null);
   const [sending, setSending] = useState(false);
   const listRef = useRef<FlatList<ChatMessage>>(null);
 
@@ -325,9 +460,42 @@ function ChatScreen({
         return;
       }
       const result = source === 'camera'
-        ? await ImagePicker.launchCameraAsync({ mediaTypes: ['images'], quality: 0.85 })
-        : await ImagePicker.launchImageLibraryAsync({ mediaTypes: ['images'], quality: 0.85 });
-      if (!result.canceled && result.assets[0]) setPendingPhoto(result.assets[0]);
+        ? await ImagePicker.launchCameraAsync({ mediaTypes: ['images'], quality: 0.85, exif: true })
+        : await ImagePicker.launchImageLibraryAsync({ mediaTypes: ['images'], quality: 0.85, exif: true });
+      if (!result.canceled && result.assets[0]) {
+        const asset = result.assets[0];
+        if (source === 'camera') {
+          setPendingPhoto({
+            asset,
+            source,
+            takenAt: new Date().toISOString(),
+            takenAtSource: 'camera',
+            coordinates: null,
+            locationSource: null,
+            placeLabel: null,
+            metadataLoading: false,
+          });
+        } else {
+          setPendingPhoto({
+            asset,
+            source,
+            takenAt: null,
+            takenAtSource: null,
+            coordinates: null,
+            locationSource: null,
+            placeLabel: null,
+            metadataLoading: true,
+          });
+          const history = await readLibraryPhotoHistory(asset);
+          setPendingPhoto((current) => current?.asset.uri === asset.uri ? {
+            ...current,
+            ...history,
+            takenAtSource: history.takenAt ? 'photo' : null,
+            locationSource: history.coordinates ? 'photo' : null,
+            metadataLoading: false,
+          } : current);
+        }
+      }
     } catch (error) {
       Alert.alert('Could not open photos', errorMessage(error));
     }
@@ -356,14 +524,14 @@ function ChatScreen({
   async function sendMessage(textOverride?: string) {
     const text = (textOverride ?? draft).trim();
     const photo = pendingPhoto;
-    if (sending || (!text && !photo)) return;
+    if (sending || photo?.metadataLoading || (!text && !photo)) return;
 
     const userId = messageId('user');
     addMessage({
       id: userId,
       role: 'user',
       text: text || 'Remember this.',
-      photoUri: photo?.uri,
+      photoUri: photo?.asset.uri,
       meta: photo ? 'Saving memory…' : undefined,
     });
     if (textOverride === undefined) setDraft('');
@@ -372,23 +540,41 @@ function ChatScreen({
 
     try {
       if (photo) {
-        const coordinates = await getAutomaticLocation();
+        let coordinates = photo.coordinates;
+        let locationSource = photo.locationSource;
+        if (photo.source === 'camera' && !coordinates) {
+          coordinates = await getAutomaticLocation();
+          locationSource = coordinates ? 'current' : null;
+        }
         const form = new FormData();
-        const photoFile = new File(photo.uri);
-        form.append('photo', photoFile, photo.fileName || photoFile.name || `bepo-${Date.now()}.jpg`);
+        const photoFile = new File(photo.asset.uri);
+        form.append('photo', photoFile, photo.asset.fileName || photoFile.name || `bepo-${Date.now()}.jpg`);
         if (text) form.append('note', text);
+        if (photo.takenAt) {
+          form.append('taken_at', photo.takenAt);
+          form.append('taken_at_source', photo.takenAtSource || 'photo');
+        }
         if (coordinates) {
           form.append('lat', String(coordinates.lat));
           form.append('lon', String(coordinates.lon));
+          if (locationSource) form.append('location_source', locationSource);
         }
         await request('/memory', { method: 'POST', body: form });
-        updateMessage(userId, { meta: coordinates ? 'Saved with location' : 'Saved' });
+        updateMessage(userId, {
+          meta: photo.source === 'library'
+            ? `Saved${photo.takenAt ? ' with original date' : ''}${coordinates ? ' and location' : ''}`
+            : coordinates ? 'Saved with location' : 'Saved',
+        });
         addMessage({
           id: messageId('bepo'),
           role: 'assistant',
-          text: coordinates
-            ? 'It’s safe with me. I saved the moment, the time, and where you were.'
-            : 'It’s safe with me. I saved the moment and the time. Location wasn’t available this time.',
+          text: photo.source === 'library'
+            ? photo.takenAt || coordinates
+              ? `It’s safe with me. I kept the photo’s ${photo.takenAt ? 'original date' : ''}${photo.takenAt && coordinates ? ' and ' : ''}${coordinates ? 'location' : ''}, and separately recorded when you added this note.`
+              : 'It’s safe with me. This photo did not include its original date or place, so I left those unknown and recorded when you added it.'
+            : coordinates
+              ? 'It’s safe with me. I saved the moment, the time, and where you were.'
+              : 'It’s safe with me. I saved the moment and the time. Location wasn’t available this time.',
         });
         await onMemorySaved();
       } else {
@@ -417,7 +603,7 @@ function ChatScreen({
     }
   }
 
-  const canSend = Boolean(draft.trim() || pendingPhoto) && !sending;
+  const canSend = Boolean(draft.trim() || pendingPhoto) && !sending && !pendingPhoto?.metadataLoading;
 
   return (
     <View style={styles.fill}>
@@ -441,10 +627,27 @@ function ChatScreen({
         <View style={styles.composerArea}>
           {pendingPhoto ? (
             <View style={styles.attachmentPreview}>
-              <Image source={{ uri: pendingPhoto.uri }} style={styles.attachmentImage} />
+              <Image source={{ uri: pendingPhoto.asset.uri }} style={styles.attachmentImage} />
               <View style={styles.attachmentCopy}>
-                <Text style={styles.attachmentTitle}>New memory</Text>
-                <Text style={styles.attachmentMeta}>Time and location added automatically</Text>
+                <Text style={styles.attachmentTitle}>
+                  {pendingPhoto.metadataLoading
+                    ? 'Reading photo history…'
+                    : pendingPhoto.takenAt
+                      ? `Taken ${formatDate(pendingPhoto.takenAt)}`
+                      : pendingPhoto.source === 'camera' ? 'New memory' : 'Original date unavailable'}
+                </Text>
+                <Text style={styles.attachmentMeta}>
+                  {pendingPhoto.metadataLoading
+                    ? 'Checking its original date and place'
+                    : pendingPhoto.source === 'camera'
+                      ? 'Current location will be added when sent'
+                      : pendingPhoto.coordinates
+                        ? pendingPhoto.placeLabel || 'Original photo location found'
+                        : 'No saved location on this photo'}
+                </Text>
+                {!pendingPhoto.metadataLoading ? (
+                  <Text style={styles.attachmentHistory}>Your note time will be saved separately</Text>
+                ) : null}
               </View>
               <Pressable accessibilityLabel="Remove attached photo" style={styles.removeAttachment} onPress={() => setPendingPhoto(null)}>
                 <Text style={styles.removeAttachmentText}>×</Text>
@@ -608,15 +811,18 @@ function MemoryCard({ memory, apiUrl, apiKey, compact = false }: {
       />
       <View style={styles.memoryBody}>
         <View style={styles.memoryMetaRow}>
-          <Text style={styles.memoryDate}>{formatDate(memory.timestamp)}</Text>
+          <Text style={styles.memoryDate}>
+            {memory.taken_at ? `Taken ${formatDate(memory.taken_at)}` : 'Event date unavailable'}
+          </Text>
           {memory.mood ? <Text style={styles.pill}>{memory.mood}</Text> : null}
         </View>
         <Text style={[styles.memoryDescription, compact && styles.inlineMemoryDescription]}>{description}</Text>
         {memory.tags ? <Text style={styles.memoryTags}>{memory.tags}</Text> : null}
         {memory.place_hint ? <Text style={styles.memoryPlace}>⌖ {memory.place_hint}</Text> : null}
+        <Text style={styles.memoryHistory}>{memoryHistoryText(memory)}</Text>
         {memory.map_url ? (
           <Pressable onPress={() => Linking.openURL(memory.map_url!)}>
-            <Text style={styles.mapLink}>Open location ↗</Text>
+            <Text style={styles.mapLink}>View where this was taken ↗</Text>
           </Pressable>
         ) : null}
       </View>
@@ -633,8 +839,8 @@ function SettingsScreen(props: ConnectionProps & { onBack: () => void }) {
         <ScrollView contentContainerStyle={styles.settingsContent} keyboardShouldPersistTaps="handled">
           <ConnectionForm {...connectionProps} />
           <NoteCard
-            title="Automatic location"
-            text="When you send a photo, Bepo adds your current location automatically if you allow location access. A photo can still be saved when location is unavailable."
+            title="Automatic photo history"
+            text="Gallery photos keep their original date and location when available. New camera photos use the current time and location. Bepo never substitutes your current location for an old photo."
           />
           <NoteCard
             title="Private by default"

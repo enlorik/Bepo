@@ -61,7 +61,8 @@ def _fetch_memory_row(memory_id: int):
     try:
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT id, text_note, user_note, bepo_summary, tags, mood, place_hint, text_emb "
+            "SELECT id, text_note, user_note, bepo_summary, tags, mood, place_hint, text_emb, "
+            "note_created_at, note_updated_at "
             "FROM memories WHERE id = ?",
             (memory_id,),
         )
@@ -126,6 +127,10 @@ class TestListMemories:
         assert "tags" in m
         assert "mood" in m
         assert "place_hint" in m
+        assert "added_at" in m
+        assert "taken_at" in m
+        assert "note_created_at" in m
+        assert "location_source" in m
 
     def test_old_minimal_post_memory_still_works(self, client):
         r = client.post(
@@ -146,6 +151,21 @@ class TestListMemories:
         assert memory["mood"] is None
         assert memory["tags"] is None
         assert memory["place_hint"] is None
+
+    def test_gallery_is_ordered_by_event_date_when_known(self, client):
+        newer_event = client.post(
+            "/memory",
+            files={"photo": ("newer.jpg", _tiny_jpeg(), "image/jpeg")},
+            data={"taken_at": "2024-08-01T12:00:00", "taken_at_source": "photo"},
+        ).json()["memory_id"]
+        older_event_added_later = client.post(
+            "/memory",
+            files={"photo": ("older.jpg", _tiny_jpeg(), "image/jpeg")},
+            data={"taken_at": "2018-03-02T09:00:00", "taken_at_source": "photo"},
+        ).json()["memory_id"]
+
+        memories = client.get("/memories").json()
+        assert [memory["id"] for memory in memories] == [newer_event, older_event_added_later]
 
 
 class TestGetMemory:
@@ -199,6 +219,37 @@ class TestGetMemory:
         assert data["mood"] == "calm"
         assert data["place_hint"] == "near red couch"
 
+    def test_keeps_photo_time_separate_from_added_and_note_times(self, client):
+        resp = client.post(
+            "/memory",
+            files={"photo": ("img.jpg", _tiny_jpeg(), "image/jpeg")},
+            data={
+                "note": "an older summer day",
+                "taken_at": "2021-07-18T14:20:00",
+                "taken_at_source": "photo",
+                "lat": "54.3520",
+                "lon": "18.6466",
+                "location_source": "photo",
+            },
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["taken_at"] == "2021-07-18T14:20:00"
+        assert data["taken_at_source"] == "photo"
+        assert data["location_source"] == "photo"
+        assert data["added_at"] == data["timestamp"]
+        assert data["note_created_at"] == data["added_at"]
+        assert data["note_updated_at"] == data["added_at"]
+
+    def test_rejects_invalid_photo_time(self, client):
+        resp = client.post(
+            "/memory",
+            files={"photo": ("img.jpg", _tiny_jpeg(), "image/jpeg")},
+            data={"taken_at": "not-a-date"},
+        )
+        assert resp.status_code == 422
+        assert "taken_at" in resp.json()["detail"]
+
 
 class TestGetImage:
     def test_404_for_missing_memory(self, client):
@@ -245,6 +296,24 @@ class TestPatchMemoryMetadata:
         assert data["place_hint"] == "near the fountain"
         assert "text_emb" not in data
         assert "image_emb" not in data
+
+    def test_records_when_a_note_is_added_later(self, client):
+        create_r = client.post(
+            "/memory",
+            files={"photo": ("img.jpg", _tiny_jpeg(), "image/jpeg")},
+        )
+        memory_id = create_r.json()["memory_id"]
+        assert create_r.json()["note_created_at"] is None
+
+        patch_r = client.patch(
+            f"/memory/{memory_id}/metadata",
+            json={"note": "remembered this later"},
+        )
+
+        assert patch_r.status_code == 200
+        data = patch_r.json()
+        assert data["note_created_at"] is not None
+        assert data["note_updated_at"] == data["note_created_at"]
 
     def test_omitted_fields_preserve_existing_values(self, client):
         create_r = client.post(
@@ -524,6 +593,8 @@ class TestChat:
                 "mood": "calm",
                 "tags": "cafe,cat,cozy",
                 "place_hint": "near the red couch hallway",
+                "taken_at": "2021-07-18T14:20:00",
+                "taken_at_source": "photo",
             },
         )
         r = client.post("/chat", json={"message": "calm cafe with a cat"})
@@ -533,6 +604,7 @@ class TestChat:
         answer = data["answer"]
         # Answer should reference the place hint and/or mood/tags
         assert any(kw in answer for kw in ["red couch", "calm", "cafe", "cat", "cozy"])
+        assert "July 18, 2021" in answer
 
     def test_does_not_expose_embeddings(self, client):
         client.post(
@@ -616,10 +688,18 @@ class TestInitDbMigration:
             cursor2 = conn2.cursor()
             cursor2.execute("PRAGMA table_info(memories)")
             columns = {row[1] for row in cursor2.fetchall()}
-            assert {"user_note", "bepo_summary", "tags", "mood", "place_hint"}.issubset(columns)
+            assert {
+                "user_note", "bepo_summary", "tags", "mood", "place_hint",
+                "taken_at", "taken_at_source", "location_source",
+                "note_created_at", "note_updated_at",
+            }.issubset(columns)
 
-            cursor2.execute("SELECT text_note, lat, lon FROM memories")
+            cursor2.execute("SELECT text_note, lat, lon, taken_at, note_created_at, note_updated_at FROM memories")
             row = cursor2.fetchone()
-            assert row == ("legacy note", 1.0, 2.0)
+            assert row == (
+                "legacy note", 1.0, 2.0, None,
+                "2026-01-01T00:00:00", "2026-01-01T00:00:00",
+            )
         finally:
             conn2.close()
+

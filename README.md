@@ -87,8 +87,11 @@ Store a new memory with a photo, optional text note/metadata, and GPS coordinate
 - `tags` (string, optional): Comma-separated or free-form tags
 - `mood` (string, optional): Mood/emotion hint (for example `calm`, `excited`)
 - `place_hint` (string, optional): Optional place cue (for example `near red couch hallway`)
+- `taken_at` (ISO date/time, optional): When the photographed event happened
+- `taken_at_source` (string, optional): `photo`, `camera`, or `manual`
 - `lat` (float, optional): Latitude coordinate
 - `lon` (float, optional): Longitude coordinate
+- `location_source` (string, optional): `photo`, `current`, or `manual`
 
 **Example:**
 ```bash
@@ -97,8 +100,11 @@ curl -X POST "http://127.0.0.1:8000/memory" \
   -F "note=Beautiful sunset at the beach" \
   -F "mood=calm" \
   -F "tags=beach,sunset" \
+  -F "taken_at=2021-07-18T14:20:00" \
+  -F "taken_at_source=photo" \
   -F "lat=34.0522" \
-  -F "lon=-118.2437"
+  -F "lon=-118.2437" \
+  -F "location_source=photo"
 ```
 
 **Response:**
@@ -107,6 +113,11 @@ curl -X POST "http://127.0.0.1:8000/memory" \
   "status": "success",
   "memory_id": 1,
   "timestamp": "2024-01-01T12:00:00.000000",
+  "added_at": "2024-01-01T12:00:00.000000",
+  "taken_at": "2021-07-18T14:20:00",
+  "taken_at_source": "photo",
+  "note_created_at": "2024-01-01T12:00:00.000000",
+  "note_updated_at": "2024-01-01T12:00:00.000000",
   "image_path": "images/20240101_120000_000000.jpg",
   "image_url": "/image/1",
   "note": "Beautiful sunset at the beach",
@@ -117,6 +128,7 @@ curl -X POST "http://127.0.0.1:8000/memory" \
   "place_hint": null,
   "lat": 34.0522,
   "lon": -118.2437,
+  "location_source": "photo",
   "map_url": "https://www.google.com/maps/search/?api=1&query=34.0522,-118.2437"
 }
 ```
@@ -172,8 +184,8 @@ curl -X PATCH "http://127.0.0.1:8000/memory/1/metadata" \
 
 ### GET /memories
 
-Return all saved memories, newest first. Embeddings are not included.
-Includes `note`, `user_note`, `bepo_summary`, `tags`, `mood`, `place_hint`, `lat`, `lon`, `map_url`, and `image_url`.
+Return all saved memories in event-date order when the photo date is known. Embeddings are not included.
+Includes separate event, added, and note timestamps plus `note`, `user_note`, `bepo_summary`, `tags`, `mood`, `place_hint`, `lat`, `lon`, `map_url`, and `image_url`.
 
 **Example:**
 ```bash
@@ -370,12 +382,17 @@ CI sets `TRANSFORMERS_OFFLINE=1` and `HF_HUB_OFFLINE=1` defensively so tests nev
 CREATE TABLE memories (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts DATETIME NOT NULL,
+    taken_at DATETIME,
+    taken_at_source TEXT,
     lat REAL,
     lon REAL,
+    location_source TEXT,
     image_path TEXT NOT NULL,
     image_emb BLOB NOT NULL,
     text_note TEXT,
     text_emb BLOB,
+    note_created_at DATETIME,
+    note_updated_at DATETIME,
     user_note TEXT,
     bepo_summary TEXT,
     tags TEXT,
@@ -384,7 +401,7 @@ CREATE TABLE memories (
 );
 ```
 
-`text_note` is kept for backward compatibility. On startup, Bepo runs a migration-safe schema check (`PRAGMA table_info(memories)` + `ALTER TABLE ... ADD COLUMN`) so existing `memories.db` files are upgraded in place without dropping data.
+`ts` remains the time a memory was added and `text_note` is kept for backward compatibility. `taken_at` is the original event time when known. On startup, Bepo runs a migration-safe schema check (`PRAGMA table_info(memories)` + `ALTER TABLE ... ADD COLUMN`) so existing `memories.db` files are upgraded in place without dropping data.
 
 For semantic search, Bepo builds text embeddings from all available memory text fields (`note`, `user_note`, `bepo_summary`, `tags`, `mood`, `place_hint`). These richer fields are intended for future Bepo chat and personal recall features.
 
@@ -416,3 +433,4 @@ Bepo does not call a hosted AI API. All processing happens inside the running Be
 **Why an exact scan instead of an approximate index** — 10,000 memories is around 5 million multiply-adds in NumPy, which takes milliseconds. Adding FAISS or hnswlib at that scale would add complexity and trade exactness for a speed gain that isn't needed. The upgrade path when scale demands it: matrix-ise the scan first (`M @ q`, one BLAS call), cache the matrix in RAM, then add an ANN index when the collection approaches 10⁵ entries or becomes multi-user.
 
 **Why SQLite with BLOB embeddings** — Everything runs on one machine with no external service dependency. A single file is straightforward to back up and reason about. The cost is no vector index (hence the exact scan) and two sources of truth: the database holds a path, the actual image file lives on the filesystem.
+
