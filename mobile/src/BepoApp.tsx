@@ -60,6 +60,7 @@ type ChatMessage = {
   text: string;
   photoUri?: string;
   tags?: string[];
+  moods?: string[];
   memories?: Memory[];
   meta?: string;
   error?: boolean;
@@ -253,6 +254,37 @@ function knownTagsFromMemories(memories: Memory[]) {
   return [...usage.entries()]
     .sort((left, right) => right[1].count - left[1].count || left[1].recentIndex - right[1].recentIndex)
     .map(([tag]) => tag);
+}
+
+const STARTER_MOODS = ['calm', 'cozy', 'happy', 'excited', 'nostalgic', 'safe', 'romantic', 'sad', 'anxious'];
+
+function normalizeMood(value: string) {
+  return value
+    .trim()
+    .replace(/,/g, ' ')
+    .replace(/\s+/g, ' ')
+    .toLocaleLowerCase();
+}
+
+function splitStoredMoods(value: string | null | undefined) {
+  if (!value) return [];
+  return [...new Set(value.split(',').map(normalizeMood).filter(Boolean))];
+}
+
+function knownMoodsFromMemories(memories: Memory[]) {
+  const usage = new Map<string, { count: number; recentIndex: number }>();
+  memories.forEach((memory, memoryIndex) => {
+    splitStoredMoods(memory.mood).forEach((mood) => {
+      const current = usage.get(mood);
+      usage.set(mood, {
+        count: (current?.count || 0) + 1,
+        recentIndex: current?.recentIndex ?? memoryIndex,
+      });
+    });
+  });
+  return [...usage.entries()]
+    .sort((left, right) => right[1].count - left[1].count || left[1].recentIndex - right[1].recentIndex)
+    .map(([mood]) => mood);
 }
 
 function activeHashtag(value: string) {
@@ -453,6 +485,7 @@ export default function BepoApp() {
           apiKey={apiKey}
           memoryCount={memories.length}
           knownTags={knownTagsFromMemories(memories)}
+          knownMoods={knownMoodsFromMemories(memories)}
           onMemorySaved={() => loadMemories(true)}
           onOpenMemories={() => setScreen('memories')}
           onOpenSettings={() => setScreen('settings')}
@@ -494,6 +527,7 @@ function ChatScreen({
   apiKey,
   memoryCount,
   knownTags,
+  knownMoods,
   onMemorySaved,
   onOpenMemories,
   onOpenSettings,
@@ -503,6 +537,7 @@ function ChatScreen({
   apiKey: string;
   memoryCount: number;
   knownTags: string[];
+  knownMoods: string[];
   onMemorySaved: () => Promise<void>;
   onOpenMemories: () => void;
   onOpenSettings: () => void;
@@ -511,9 +546,14 @@ function ChatScreen({
   const [draft, setDraft] = useState('');
   const [pendingPhoto, setPendingPhoto] = useState<PendingPhoto | null>(null);
   const [selectedTags, setSelectedTags] = useState<string[]>([]);
+  const [selectedMoods, setSelectedMoods] = useState<string[]>([]);
+  const [moodPickerOpen, setMoodPickerOpen] = useState(false);
+  const [addingMood, setAddingMood] = useState(false);
+  const [moodDraft, setMoodDraft] = useState('');
   const [sending, setSending] = useState(false);
   const listRef = useRef<FlatList<ChatMessage>>(null);
   const inputRef = useRef<TextInput>(null);
+  const moodInputRef = useRef<TextInput>(null);
 
   function addMessage(message: ChatMessage) {
     setMessages((current) => [...current, message]);
@@ -546,6 +586,22 @@ function ChatScreen({
 
   function removeTag(tag: string) {
     setSelectedTags((current) => current.filter((item) => item !== tag));
+  }
+
+  function toggleMood(mood: string) {
+    const normalized = normalizeMood(mood);
+    if (!normalized) return;
+    setSelectedMoods((current) => current.includes(normalized)
+      ? current.filter((item) => item !== normalized)
+      : [...current, normalized]);
+  }
+
+  function saveCustomMood() {
+    const mood = normalizeMood(moodDraft);
+    if (!mood) return;
+    setSelectedMoods((current) => current.includes(mood) ? current : [...current, mood]);
+    setMoodDraft('');
+    setAddingMood(false);
   }
 
   async function choosePhoto(source: 'camera' | 'library') {
@@ -625,6 +681,7 @@ function ChatScreen({
     const taggedNote = photo ? finalizeTaggedNote(rawText, selectedTags) : { note: rawText, tags: [] };
     const text = taggedNote.note;
     const tags = taggedNote.tags;
+    const moods = photo ? selectedMoods : [];
     if (sending || photo?.metadataLoading || (!text && !photo)) return;
 
     const userId = messageId('user');
@@ -634,11 +691,16 @@ function ChatScreen({
       text: text || 'Remember this.',
       photoUri: photo?.asset.uri,
       tags: tags.length ? tags : undefined,
+      moods: moods.length ? moods : undefined,
       meta: photo ? 'Saving memory…' : undefined,
     });
     if (textOverride === undefined) setDraft('');
     setPendingPhoto(null);
     setSelectedTags([]);
+    setSelectedMoods([]);
+    setMoodPickerOpen(false);
+    setAddingMood(false);
+    setMoodDraft('');
     setSending(true);
 
     try {
@@ -654,6 +716,7 @@ function ChatScreen({
         form.append('photo', photoFile, photo.asset.fileName || photoFile.name || `bepo-${Date.now()}.jpg`);
         if (text) form.append('note', text);
         if (tags.length) form.append('tags', tags.join(','));
+        if (moods.length) form.append('mood', moods.join(','));
         if (photo.takenAt) {
           form.append('taken_at', photo.takenAt);
           form.append('taken_at_source', photo.takenAtSource || 'photo');
@@ -719,6 +782,7 @@ function ChatScreen({
     && !selectedTags.includes(activeTag.query)
     && !knownTags.includes(activeTag.query),
   );
+  const moodOptions = [...new Set([...knownMoods, ...STARTER_MOODS, ...selectedMoods])];
 
   return (
     <View style={styles.fill}>
@@ -770,10 +834,108 @@ function ChatScreen({
                 onPress={() => {
                   setPendingPhoto(null);
                   setSelectedTags([]);
+                  setSelectedMoods([]);
+                  setMoodPickerOpen(false);
+                  setAddingMood(false);
+                  setMoodDraft('');
                 }}
               >
                 <Text style={styles.removeAttachmentText}>×</Text>
               </Pressable>
+            </View>
+          ) : null}
+          {pendingPhoto ? (
+            <View style={styles.moodControlRow}>
+              {selectedMoods.length ? (
+                <ScrollView
+                  style={styles.selectedMoodScroller}
+                  horizontal
+                  showsHorizontalScrollIndicator={false}
+                  keyboardShouldPersistTaps="always"
+                  contentContainerStyle={styles.selectedMoodRow}
+                >
+                  {selectedMoods.map((mood) => (
+                    <Pressable
+                      key={mood}
+                      accessibilityLabel={`Remove mood ${mood}`}
+                      style={styles.selectedMoodChip}
+                      onPress={() => toggleMood(mood)}
+                    >
+                      <Text style={styles.selectedMoodText}>{mood}</Text>
+                      <Ionicons name="close" size={13} color="#4F6B5B" />
+                    </Pressable>
+                  ))}
+                </ScrollView>
+              ) : <View style={styles.moodControlSpacer} />}
+              <Pressable
+                accessibilityLabel={moodPickerOpen ? 'Close mood choices' : 'Choose moods'}
+                style={[styles.moodButton, (moodPickerOpen || selectedMoods.length > 0) && styles.moodButtonActive]}
+                onPress={() => {
+                  setMoodPickerOpen((current) => !current);
+                  if (moodPickerOpen) setAddingMood(false);
+                }}
+              >
+                <Ionicons name={moodPickerOpen ? 'happy' : 'happy-outline'} size={18} color="#4F6B5B" />
+                {selectedMoods.length ? <Text style={styles.moodCount}>{selectedMoods.length}</Text> : null}
+              </Pressable>
+            </View>
+          ) : null}
+          {pendingPhoto && moodPickerOpen ? (
+            <View style={styles.moodPicker}>
+              <ScrollView
+                horizontal
+                showsHorizontalScrollIndicator={false}
+                keyboardShouldPersistTaps="always"
+                contentContainerStyle={styles.moodOptionRow}
+              >
+                {moodOptions.map((mood) => {
+                  const selected = selectedMoods.includes(mood);
+                  return (
+                    <Pressable
+                      key={mood}
+                      accessibilityLabel={`${selected ? 'Remove' : 'Choose'} mood ${mood}`}
+                      style={[styles.moodOptionChip, selected && styles.moodOptionChipSelected]}
+                      onPress={() => toggleMood(mood)}
+                    >
+                      {selected ? <Ionicons name="checkmark" size={13} color="#4F6B5B" /> : null}
+                      <Text style={[styles.moodOptionText, selected && styles.moodOptionTextSelected]}>{mood}</Text>
+                    </Pressable>
+                  );
+                })}
+                <Pressable
+                  accessibilityLabel="Add a custom mood"
+                  style={[styles.moodOptionChip, styles.addMoodChip]}
+                  onPress={() => {
+                    setAddingMood(true);
+                    requestAnimationFrame(() => moodInputRef.current?.focus());
+                  }}
+                >
+                  <Ionicons name="add" size={15} color="#4F6B5B" />
+                  <Text style={styles.moodOptionTextSelected}>add</Text>
+                </Pressable>
+              </ScrollView>
+              {addingMood ? (
+                <View style={styles.customMoodRow}>
+                  <TextInput
+                    ref={moodInputRef}
+                    style={styles.customMoodInput}
+                    value={moodDraft}
+                    onChangeText={setMoodDraft}
+                    placeholder="Name a mood…"
+                    placeholderTextColor="#8B8B85"
+                    returnKeyType="done"
+                    onSubmitEditing={saveCustomMood}
+                  />
+                  <Pressable
+                    accessibilityLabel="Save custom mood"
+                    style={[styles.customMoodSave, !normalizeMood(moodDraft) && styles.customMoodSaveDisabled]}
+                    onPress={saveCustomMood}
+                    disabled={!normalizeMood(moodDraft)}
+                  >
+                    <Ionicons name="checkmark" size={18} color="#FFFFFF" />
+                  </Pressable>
+                </View>
+              ) : null}
             </View>
           ) : null}
           {pendingPhoto && selectedTags.length ? (
@@ -917,6 +1079,11 @@ function ChatBubble({ message, apiUrl, apiKey }: { message: ChatMessage; apiUrl:
               {message.tags.map((tag) => <Text key={tag} style={styles.userTag}>#{tag}</Text>)}
             </View>
           ) : null}
+          {message.moods?.length ? (
+            <View style={styles.userMoodRow}>
+              {message.moods.map((mood) => <Text key={mood} style={styles.userMood}>{mood}</Text>)}
+            </View>
+          ) : null}
           {message.meta ? <Text style={styles.userBubbleMeta}>{message.meta}</Text> : null}
         </View>
       </View>
@@ -997,7 +1164,11 @@ function MemoryCard({ memory, apiUrl, apiKey, compact = false }: {
           <Text style={styles.memoryDate}>
             {memory.taken_at ? `Taken ${formatDate(memory.taken_at)}` : 'Event date unavailable'}
           </Text>
-          {memory.mood ? <Text style={styles.pill}>{memory.mood}</Text> : null}
+          {memory.mood ? (
+            <View style={styles.memoryMoodRow}>
+              {splitStoredMoods(memory.mood).map((mood) => <Text key={mood} style={styles.pill}>{mood}</Text>)}
+            </View>
+          ) : null}
         </View>
         <Text style={[styles.memoryDescription, compact && styles.inlineMemoryDescription]}>{description}</Text>
         {memory.tags ? (

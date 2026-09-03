@@ -539,7 +539,7 @@ def build_chat_answer(top: dict) -> str:
 
     details = []
     if top.get("mood"):
-        details.append(top["mood"])
+        details.extend(value.strip() for value in top["mood"].split(",") if value.strip())
     if top.get("tags"):
         details.extend(t.strip() for t in top["tags"].split(",") if t.strip())
     if details:

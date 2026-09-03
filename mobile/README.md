@@ -5,8 +5,9 @@ The native Expo/React Native client for Bepo. It connects to the private Bepo AP
 ## What it includes
 
 - Take a photo or choose one from the phone library
-- Save notes, easy `#hashtags`, and optional GPS coordinates
+- Save notes, easy `#hashtags`, optional moods, and optional GPS coordinates
 - Reuse existing tags from suggestions and see saved tags as clear chips
+- Pick several moods from a compact selector or add your own; used moods are suggested again
 - Browse all saved memories
 - Search by image/text meaning
 - Ask Bepo natural-language questions about saved memories

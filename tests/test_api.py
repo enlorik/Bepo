@@ -606,6 +606,18 @@ class TestChat:
         assert any(kw in answer for kw in ["red couch", "calm", "cafe", "cat", "cozy"])
         assert "July 18, 2021" in answer
 
+    def test_answer_formats_multiple_moods_as_separate_details(self, client):
+        client.post(
+            "/memory",
+            files={"photo": ("img.jpg", _tiny_jpeg(), "image/jpeg")},
+            data={"note": "window seat", "mood": "calm,cozy", "tags": "cafe"},
+        )
+        r = client.post("/chat", json={"message": "window seat"})
+        assert r.status_code == 200
+        answer = r.json()["answer"]
+        assert "calm, cozy" in answer
+        assert "calm,cozy" not in answer
+
     def test_does_not_expose_embeddings(self, client):
         client.post(
             "/memory",
