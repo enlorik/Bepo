@@ -59,6 +59,7 @@ type ChatMessage = {
   role: 'user' | 'assistant';
   text: string;
   photoUri?: string;
+  tags?: string[];
   memories?: Memory[];
   meta?: string;
   error?: boolean;
@@ -223,6 +224,73 @@ function messageId(prefix: string) {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+function normalizeTag(value: string) {
+  return value
+    .trim()
+    .replace(/^#+/, '')
+    .replace(/\s+/g, '-')
+    .replace(/[^\p{L}\p{N}_-]/gu, '')
+    .replace(/-{2,}/g, '-')
+    .toLocaleLowerCase();
+}
+
+function splitStoredTags(value: string | null | undefined) {
+  if (!value) return [];
+  return [...new Set(value.split(',').map(normalizeTag).filter(Boolean))];
+}
+
+function knownTagsFromMemories(memories: Memory[]) {
+  const usage = new Map<string, { count: number; recentIndex: number }>();
+  memories.forEach((memory, memoryIndex) => {
+    splitStoredTags(memory.tags).forEach((tag) => {
+      const current = usage.get(tag);
+      usage.set(tag, {
+        count: (current?.count || 0) + 1,
+        recentIndex: current?.recentIndex ?? memoryIndex,
+      });
+    });
+  });
+  return [...usage.entries()]
+    .sort((left, right) => right[1].count - left[1].count || left[1].recentIndex - right[1].recentIndex)
+    .map(([tag]) => tag);
+}
+
+function activeHashtag(value: string) {
+  const match = value.match(/(?:^|\s)#([\p{L}\p{N}_-]*)$/u);
+  if (!match) return null;
+  return {
+    query: normalizeTag(match[1]),
+    start: value.lastIndexOf('#'),
+  };
+}
+
+function consumeCompletedHashtags(value: string) {
+  const tags: string[] = [];
+  const text = value.replace(/(^|\s)#([\p{L}\p{N}][\p{L}\p{N}_-]*)(?=\s)/gu, (_match, _leading, rawTag) => {
+    const tag = normalizeTag(rawTag);
+    if (tag) tags.push(tag);
+    return '';
+  });
+  return { text: text.replace(/ {2,}/g, ' ').trimStart(), tags };
+}
+
+function finalizeTaggedNote(value: string, selectedTags: string[]) {
+  const typedTags: string[] = [];
+  const note = value
+    .replace(/(^|\s)#([\p{L}\p{N}][\p{L}\p{N}_-]*)/gu, (_match, leading, rawTag) => {
+      const tag = normalizeTag(rawTag);
+      if (tag) typedTags.push(tag);
+      return leading || '';
+    })
+    .replace(/ {2,}/g, ' ')
+    .replace(/\s+([.,!?;:])/g, '$1')
+    .trim();
+  return {
+    note,
+    tags: [...new Set([...selectedTags, ...typedTags].map(normalizeTag).filter(Boolean))],
+  };
+}
+
 export default function BepoApp() {
   const [screen, setScreen] = useState<Screen>('chat');
   const [apiUrl, setApiUrl] = useState(DEFAULT_API_URL);
@@ -384,6 +452,7 @@ export default function BepoApp() {
           apiUrl={apiUrl}
           apiKey={apiKey}
           memoryCount={memories.length}
+          knownTags={knownTagsFromMemories(memories)}
           onMemorySaved={() => loadMemories(true)}
           onOpenMemories={() => setScreen('memories')}
           onOpenSettings={() => setScreen('settings')}
@@ -424,6 +493,7 @@ function ChatScreen({
   apiUrl,
   apiKey,
   memoryCount,
+  knownTags,
   onMemorySaved,
   onOpenMemories,
   onOpenSettings,
@@ -432,6 +502,7 @@ function ChatScreen({
   apiUrl: string;
   apiKey: string;
   memoryCount: number;
+  knownTags: string[];
   onMemorySaved: () => Promise<void>;
   onOpenMemories: () => void;
   onOpenSettings: () => void;
@@ -439,8 +510,10 @@ function ChatScreen({
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [draft, setDraft] = useState('');
   const [pendingPhoto, setPendingPhoto] = useState<PendingPhoto | null>(null);
+  const [selectedTags, setSelectedTags] = useState<string[]>([]);
   const [sending, setSending] = useState(false);
   const listRef = useRef<FlatList<ChatMessage>>(null);
+  const inputRef = useRef<TextInput>(null);
 
   function addMessage(message: ChatMessage) {
     setMessages((current) => [...current, message]);
@@ -448,6 +521,31 @@ function ChatScreen({
 
   function updateMessage(id: string, patch: Partial<ChatMessage>) {
     setMessages((current) => current.map((message) => (message.id === id ? { ...message, ...patch } : message)));
+  }
+
+  function addTags(tags: string[]) {
+    setSelectedTags((current) => [...new Set([...current, ...tags].map(normalizeTag).filter(Boolean))]);
+  }
+
+  function handleDraftChange(value: string) {
+    if (!pendingPhoto) {
+      setDraft(value);
+      return;
+    }
+    const consumed = consumeCompletedHashtags(value);
+    setDraft(consumed.text);
+    if (consumed.tags.length) addTags(consumed.tags);
+  }
+
+  function selectTag(tag: string) {
+    const active = activeHashtag(draft);
+    if (active) setDraft(draft.slice(0, active.start).trimEnd());
+    addTags([tag]);
+    requestAnimationFrame(() => inputRef.current?.focus());
+  }
+
+  function removeTag(tag: string) {
+    setSelectedTags((current) => current.filter((item) => item !== tag));
   }
 
   async function choosePhoto(source: 'camera' | 'library') {
@@ -522,8 +620,11 @@ function ChatScreen({
   }
 
   async function sendMessage(textOverride?: string) {
-    const text = (textOverride ?? draft).trim();
     const photo = pendingPhoto;
+    const rawText = (textOverride ?? draft).trim();
+    const taggedNote = photo ? finalizeTaggedNote(rawText, selectedTags) : { note: rawText, tags: [] };
+    const text = taggedNote.note;
+    const tags = taggedNote.tags;
     if (sending || photo?.metadataLoading || (!text && !photo)) return;
 
     const userId = messageId('user');
@@ -532,10 +633,12 @@ function ChatScreen({
       role: 'user',
       text: text || 'Remember this.',
       photoUri: photo?.asset.uri,
+      tags: tags.length ? tags : undefined,
       meta: photo ? 'Saving memory…' : undefined,
     });
     if (textOverride === undefined) setDraft('');
     setPendingPhoto(null);
+    setSelectedTags([]);
     setSending(true);
 
     try {
@@ -550,6 +653,7 @@ function ChatScreen({
         const photoFile = new File(photo.asset.uri);
         form.append('photo', photoFile, photo.asset.fileName || photoFile.name || `bepo-${Date.now()}.jpg`);
         if (text) form.append('note', text);
+        if (tags.length) form.append('tags', tags.join(','));
         if (photo.takenAt) {
           form.append('taken_at', photo.takenAt);
           form.append('taken_at_source', photo.takenAtSource || 'photo');
@@ -604,6 +708,17 @@ function ChatScreen({
   }
 
   const canSend = Boolean(draft.trim() || pendingPhoto) && !sending && !pendingPhoto?.metadataLoading;
+  const activeTag = pendingPhoto ? activeHashtag(draft) : null;
+  const matchingTags = activeTag
+    ? knownTags
+      .filter((tag) => !selectedTags.includes(tag) && (!activeTag.query || tag.startsWith(activeTag.query)))
+      .slice(0, 6)
+    : [];
+  const canCreateTag = Boolean(
+    activeTag?.query
+    && !selectedTags.includes(activeTag.query)
+    && !knownTags.includes(activeTag.query),
+  );
 
   return (
     <View style={styles.fill}>
@@ -649,9 +764,71 @@ function ChatScreen({
                   <Text style={styles.attachmentHistory}>Your note time will be saved separately</Text>
                 ) : null}
               </View>
-              <Pressable accessibilityLabel="Remove attached photo" style={styles.removeAttachment} onPress={() => setPendingPhoto(null)}>
+              <Pressable
+                accessibilityLabel="Remove attached photo"
+                style={styles.removeAttachment}
+                onPress={() => {
+                  setPendingPhoto(null);
+                  setSelectedTags([]);
+                }}
+              >
                 <Text style={styles.removeAttachmentText}>×</Text>
               </Pressable>
+            </View>
+          ) : null}
+          {pendingPhoto && selectedTags.length ? (
+            <ScrollView
+              horizontal
+              showsHorizontalScrollIndicator={false}
+              keyboardShouldPersistTaps="always"
+              contentContainerStyle={styles.selectedTagRow}
+            >
+              {selectedTags.map((tag) => (
+                <Pressable
+                  key={tag}
+                  accessibilityLabel={`Remove tag ${tag}`}
+                  style={styles.selectedTagChip}
+                  onPress={() => removeTag(tag)}
+                >
+                  <Text style={styles.selectedTagText}>#{tag}</Text>
+                  <Ionicons name="close" size={13} color="#765D45" />
+                </Pressable>
+              ))}
+            </ScrollView>
+          ) : null}
+          {pendingPhoto && activeTag ? (
+            <View style={styles.tagSuggestions}>
+              {matchingTags.length || canCreateTag ? (
+                <ScrollView
+                  horizontal
+                  showsHorizontalScrollIndicator={false}
+                  keyboardShouldPersistTaps="always"
+                  contentContainerStyle={styles.tagSuggestionRow}
+                >
+                  {matchingTags.map((tag) => (
+                    <Pressable
+                      key={tag}
+                      accessibilityLabel={`Use tag ${tag}`}
+                      style={styles.tagSuggestionChip}
+                      onPress={() => selectTag(tag)}
+                    >
+                      <Text style={styles.tagSuggestionText}>#{tag}</Text>
+                    </Pressable>
+                  ))}
+                  {canCreateTag && activeTag.query ? (
+                    <Pressable
+                      accessibilityLabel={`Create tag ${activeTag.query}`}
+                      style={[styles.tagSuggestionChip, styles.createTagChip]}
+                      onPress={() => selectTag(activeTag.query)}
+                    >
+                      <Ionicons name="add" size={15} color="#4F6B5B" />
+                      <Text style={styles.createTagText}>#{activeTag.query}</Text>
+                    </Pressable>
+                  ) : null}
+                </ScrollView>
+              ) : (
+                <Text style={styles.tagSuggestionHint}>Keep typing to make a new tag</Text>
+              )}
             </View>
           ) : null}
           <View style={styles.composer}>
@@ -664,11 +841,12 @@ function ChatScreen({
               </Pressable>
             </View>
             <TextInput
+              ref={inputRef}
               style={styles.composerInput}
               value={draft}
-              onChangeText={setDraft}
+              onChangeText={handleDraftChange}
               multiline
-              placeholder={pendingPhoto ? 'Add what you remember…' : 'Message Bepo…'}
+              placeholder={pendingPhoto ? 'Add a note… use # for tags' : 'Message Bepo…'}
               placeholderTextColor="#8B8B85"
             />
             <Pressable
@@ -734,6 +912,11 @@ function ChatBubble({ message, apiUrl, apiKey }: { message: ChatMessage; apiUrl:
         <View style={styles.userBubble}>
           {message.photoUri ? <Image source={{ uri: message.photoUri }} style={styles.userPhoto} /> : null}
           <Text style={styles.userBubbleText}>{message.text}</Text>
+          {message.tags?.length ? (
+            <View style={styles.userTagRow}>
+              {message.tags.map((tag) => <Text key={tag} style={styles.userTag}>#{tag}</Text>)}
+            </View>
+          ) : null}
           {message.meta ? <Text style={styles.userBubbleMeta}>{message.meta}</Text> : null}
         </View>
       </View>
@@ -817,7 +1000,11 @@ function MemoryCard({ memory, apiUrl, apiKey, compact = false }: {
           {memory.mood ? <Text style={styles.pill}>{memory.mood}</Text> : null}
         </View>
         <Text style={[styles.memoryDescription, compact && styles.inlineMemoryDescription]}>{description}</Text>
-        {memory.tags ? <Text style={styles.memoryTags}>{memory.tags}</Text> : null}
+        {memory.tags ? (
+          <View style={styles.memoryTags}>
+            {splitStoredTags(memory.tags).map((tag) => <Text key={tag} style={styles.memoryTag}>#{tag}</Text>)}
+          </View>
+        ) : null}
         {memory.place_hint ? <Text style={styles.memoryPlace}>⌖ {memory.place_hint}</Text> : null}
         <Text style={styles.memoryHistory}>{memoryHistoryText(memory)}</Text>
         {memory.map_url ? (
