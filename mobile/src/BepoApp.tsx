@@ -27,7 +27,9 @@ const DEFAULT_API_URL = 'https://bepo-production.up.railway.app';
 const KEY_STORAGE_NAME = 'bepo_api_key';
 const URL_STORAGE_NAME = 'bepo_api_url';
 
-type Screen = 'chat' | 'memories' | 'settings';
+type Screen = 'chat' | 'memories' | 'memory' | 'settings';
+type MemoryContext = 'physical' | 'online' | 'mixed' | 'unknown';
+type ShoppingStatus = 'want' | 'ordered' | 'bought' | 'returned' | 'no_longer_want';
 
 type Memory = {
   id: number;
@@ -43,6 +45,9 @@ type Memory = {
   tags?: string | null;
   mood?: string | null;
   place_hint?: string | null;
+  context_type?: MemoryContext;
+  shopping_status?: ShoppingStatus | null;
+  shopping_status_updated_at?: string | null;
   lat: number | null;
   lon: number | null;
   location_source?: 'photo' | 'current' | 'manual' | null;
@@ -258,6 +263,29 @@ function knownTagsFromMemories(memories: Memory[]) {
 
 const STARTER_MOODS = ['calm', 'cozy', 'happy', 'excited', 'nostalgic', 'safe', 'romantic', 'sad', 'anxious'];
 
+const CONTEXT_OPTIONS: { value: MemoryContext; label: string; icon: React.ComponentProps<typeof Ionicons>['name'] }[] = [
+  { value: 'physical', label: 'A place', icon: 'location-outline' },
+  { value: 'online', label: 'Online', icon: 'globe-outline' },
+  { value: 'mixed', label: 'Both', icon: 'git-compare-outline' },
+  { value: 'unknown', label: 'Not sure', icon: 'help-circle-outline' },
+];
+
+const SHOPPING_OPTIONS: { value: ShoppingStatus; label: string }[] = [
+  { value: 'want', label: 'Want' },
+  { value: 'ordered', label: 'Ordered' },
+  { value: 'bought', label: 'Bought' },
+  { value: 'returned', label: 'Returned' },
+  { value: 'no_longer_want', label: 'No longer want' },
+];
+
+function contextLabel(value: MemoryContext | undefined) {
+  return CONTEXT_OPTIONS.find((option) => option.value === value)?.label || 'Not sure';
+}
+
+function shoppingLabel(value: ShoppingStatus | null | undefined) {
+  return SHOPPING_OPTIONS.find((option) => option.value === value)?.label || null;
+}
+
 function normalizeMood(value: string) {
   return value
     .trim()
@@ -325,6 +353,7 @@ function finalizeTaggedNote(value: string, selectedTags: string[]) {
 
 export default function BepoApp() {
   const [screen, setScreen] = useState<Screen>('chat');
+  const [selectedMemoryId, setSelectedMemoryId] = useState<number | null>(null);
   const [apiUrl, setApiUrl] = useState(DEFAULT_API_URL);
   const [apiKey, setApiKey] = useState('');
   const [draftUrl, setDraftUrl] = useState(DEFAULT_API_URL);
@@ -335,6 +364,7 @@ export default function BepoApp() {
   const [memories, setMemories] = useState<Memory[]>([]);
   const [loadingMemories, setLoadingMemories] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
+  const selectedMemory = memories.find((memory) => memory.id === selectedMemoryId) || null;
 
   const request = useCallback(
     async (path: string, options: RequestInit = {}, keyOverride?: string, urlOverride?: string) => {
@@ -439,6 +469,17 @@ export default function BepoApp() {
     }
   }
 
+  function openMemory(memoryId: number) {
+    setSelectedMemoryId(memoryId);
+    setScreen('memory');
+  }
+
+  function updateMemory(updatedMemory: Memory) {
+    setMemories((current) => current.map((memory) => (
+      memory.id === updatedMemory.id ? updatedMemory : memory
+    )));
+  }
+
   if (hydrating) {
     return (
       <View style={styles.centeredPage}>
@@ -503,6 +544,19 @@ export default function BepoApp() {
             loadMemories(true);
           }}
           onBack={() => setScreen('chat')}
+          onOpenMemory={openMemory}
+        />
+      ) : null}
+      {screen === 'memory' && selectedMemory ? (
+        <MemoryDetailScreen
+          memory={selectedMemory}
+          apiUrl={apiUrl}
+          apiKey={apiKey}
+          request={request}
+          knownTags={knownTagsFromMemories(memories)}
+          knownMoods={knownMoodsFromMemories(memories)}
+          onBack={() => setScreen('memories')}
+          onSaved={updateMemory}
         />
       ) : null}
       {screen === 'settings' ? (
@@ -1115,7 +1169,7 @@ function TypingBubble() {
   );
 }
 
-function MemoriesScreen({ memories, apiUrl, apiKey, loading, refreshing, onRefresh, onBack }: {
+function MemoriesScreen({ memories, apiUrl, apiKey, loading, refreshing, onRefresh, onBack, onOpenMemory }: {
   memories: Memory[];
   apiUrl: string;
   apiKey: string;
@@ -1123,6 +1177,7 @@ function MemoriesScreen({ memories, apiUrl, apiKey, loading, refreshing, onRefre
   refreshing: boolean;
   onRefresh: () => void;
   onBack: () => void;
+  onOpenMemory: (memoryId: number) => void;
 }) {
   return (
     <View style={styles.fill}>
@@ -1139,21 +1194,40 @@ function MemoriesScreen({ memories, apiUrl, apiKey, loading, refreshing, onRefre
             <Text style={styles.galleryEmptyCopy}>Go back to the conversation and attach your first photo.</Text>
           </View>
         )}
-        renderItem={({ item }) => <MemoryCard memory={item} apiUrl={apiUrl} apiKey={apiKey} />}
+        renderItem={({ item }) => (
+          <MemoryCard
+            memory={item}
+            apiUrl={apiUrl}
+            apiKey={apiKey}
+            onPress={() => onOpenMemory(item.id)}
+          />
+        )}
       />
     </View>
   );
 }
 
-function MemoryCard({ memory, apiUrl, apiKey, compact = false }: {
+function MemoryCard({ memory, apiUrl, apiKey, compact = false, onPress }: {
   memory: Memory;
   apiUrl: string;
   apiKey: string;
   compact?: boolean;
+  onPress?: () => void;
 }) {
-  const description = memory.bepo_summary || memory.user_note || memory.note || 'A saved moment';
+  const description = memory.user_note || memory.bepo_summary || memory.note || 'A saved moment';
+  const status = shoppingLabel(memory.shopping_status);
   return (
-    <View style={[styles.memoryCard, compact && styles.inlineMemoryCard]}>
+    <Pressable
+      disabled={!onPress}
+      onPress={onPress}
+      accessibilityRole={onPress ? 'button' : undefined}
+      accessibilityLabel={onPress ? `Open memory: ${description}` : undefined}
+      style={({ pressed }) => [
+        styles.memoryCard,
+        compact && styles.inlineMemoryCard,
+        pressed && styles.memoryCardPressed,
+      ]}
+    >
       <Image
         source={{ uri: absoluteUrl(apiUrl, memory.image_url), headers: { 'X-API-Key': apiKey } }}
         style={[styles.memoryImage, compact && styles.inlineMemoryImage]}
@@ -1176,6 +1250,10 @@ function MemoryCard({ memory, apiUrl, apiKey, compact = false }: {
             {splitStoredTags(memory.tags).map((tag) => <Text key={tag} style={styles.memoryTag}>#{tag}</Text>)}
           </View>
         ) : null}
+        <View style={styles.memoryDetailsRow}>
+          <Text style={styles.memoryContext}>{memory.context_type === 'online' ? '◎ Online' : memory.context_type === 'mixed' ? '⌖ + ◎ Both' : memory.context_type === 'physical' ? '⌖ A place' : '○ Not sorted yet'}</Text>
+          {status ? <Text style={styles.memoryStatus}>{status}</Text> : null}
+        </View>
         {memory.place_hint ? <Text style={styles.memoryPlace}>⌖ {memory.place_hint}</Text> : null}
         <Text style={styles.memoryHistory}>{memoryHistoryText(memory)}</Text>
         {memory.map_url ? (
@@ -1183,7 +1261,291 @@ function MemoryCard({ memory, apiUrl, apiKey, compact = false }: {
             <Text style={styles.mapLink}>View where this was taken ↗</Text>
           </Pressable>
         ) : null}
+        {onPress ? <Text style={styles.editMemoryHint}>Open & edit  ›</Text> : null}
       </View>
+    </Pressable>
+  );
+}
+
+function MemoryDetailScreen({
+  memory,
+  apiUrl,
+  apiKey,
+  request,
+  knownTags,
+  knownMoods,
+  onBack,
+  onSaved,
+}: {
+  memory: Memory;
+  apiUrl: string;
+  apiKey: string;
+  request: Requester;
+  knownTags: string[];
+  knownMoods: string[];
+  onBack: () => void;
+  onSaved: (memory: Memory) => void;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [note, setNote] = useState(memory.user_note || memory.note || memory.bepo_summary || '');
+  const [tags, setTags] = useState(splitStoredTags(memory.tags));
+  const [moods, setMoods] = useState(splitStoredMoods(memory.mood));
+  const [contextType, setContextType] = useState<MemoryContext>(memory.context_type || 'unknown');
+  const [shoppingStatus, setShoppingStatus] = useState<ShoppingStatus | null>(memory.shopping_status || null);
+  const [tagDraft, setTagDraft] = useState('');
+  const [moodDraft, setMoodDraft] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState('');
+
+  useEffect(() => {
+    setEditing(false);
+    setNote(memory.user_note || memory.note || memory.bepo_summary || '');
+    setTags(splitStoredTags(memory.tags));
+    setMoods(splitStoredMoods(memory.mood));
+    setContextType(memory.context_type || 'unknown');
+    setShoppingStatus(memory.shopping_status || null);
+    setTagDraft('');
+    setMoodDraft('');
+    setSaveError('');
+  }, [memory.id]);
+
+  const description = memory.user_note || memory.bepo_summary || memory.note || 'A saved moment';
+  const usedTagSuggestions = knownTags.filter((tag) => !tags.includes(tag)).slice(0, 10);
+  const moodChoices = [...new Set([...moods, ...knownMoods, ...STARTER_MOODS])];
+
+  function addTag(value = tagDraft) {
+    const tag = normalizeTag(value);
+    if (!tag) return;
+    setTags((current) => [...new Set([...current, tag])]);
+    setTagDraft('');
+  }
+
+  function addMood(value = moodDraft) {
+    const mood = normalizeMood(value);
+    if (!mood) return;
+    setMoods((current) => [...new Set([...current, mood])]);
+    setMoodDraft('');
+  }
+
+  async function saveMemory() {
+    setSaving(true);
+    setSaveError('');
+    try {
+      const updated = await request(`/memory/${memory.id}/metadata`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          user_note: note.trim() || null,
+          tags: tags.length ? tags.join(',') : null,
+          mood: moods.length ? moods.join(',') : null,
+          context_type: contextType,
+          shopping_status: shoppingStatus,
+        }),
+      }) as Memory;
+      onSaved(updated);
+      setNote(updated.user_note || updated.note || updated.bepo_summary || '');
+      setTags(splitStoredTags(updated.tags));
+      setMoods(splitStoredMoods(updated.mood));
+      setContextType(updated.context_type || 'unknown');
+      setShoppingStatus(updated.shopping_status || null);
+      setEditing(false);
+    } catch (error) {
+      setSaveError(errorMessage(error));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <View style={styles.fill}>
+      <PageHeader
+        title="Memory"
+        subtitle={memory.taken_at ? formatDate(memory.taken_at) : 'Saved moment'}
+        onBack={onBack}
+      />
+      <KeyboardAvoidingView style={styles.fill} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
+        <ScrollView
+          contentContainerStyle={styles.detailContent}
+          keyboardShouldPersistTaps="handled"
+          showsVerticalScrollIndicator={false}
+        >
+          <Image
+            source={{ uri: absoluteUrl(apiUrl, memory.image_url), headers: { 'X-API-Key': apiKey } }}
+            style={styles.detailImage}
+            resizeMode="cover"
+          />
+
+          {!editing ? (
+            <View style={styles.detailBody}>
+              <Text style={styles.detailDescription}>{description}</Text>
+              <View style={styles.detailBadgeRow}>
+                <Text style={styles.contextBadge}>{contextLabel(memory.context_type)}</Text>
+                {shoppingLabel(memory.shopping_status) ? (
+                  <Text style={styles.statusBadge}>{shoppingLabel(memory.shopping_status)}</Text>
+                ) : null}
+              </View>
+              {memory.tags ? (
+                <View style={styles.memoryTags}>
+                  {splitStoredTags(memory.tags).map((tag) => <Text key={tag} style={styles.memoryTag}>#{tag}</Text>)}
+                </View>
+              ) : null}
+              {memory.mood ? (
+                <View style={styles.detailMoodRow}>
+                  {splitStoredMoods(memory.mood).map((mood) => <Text key={mood} style={styles.pill}>{mood}</Text>)}
+                </View>
+              ) : null}
+              {memory.place_hint ? <Text style={styles.memoryPlace}>⌖ {memory.place_hint}</Text> : null}
+              <Text style={styles.detailHistory}>{memoryHistoryText(memory)}</Text>
+              {memory.shopping_status_updated_at ? (
+                <Text style={styles.detailHistory}>Shopping stage changed {formatDate(memory.shopping_status_updated_at)}</Text>
+              ) : null}
+              {memory.map_url && memory.context_type !== 'online' ? (
+                <Pressable onPress={() => Linking.openURL(memory.map_url!)}>
+                  <Text style={styles.mapLink}>View where this was taken ↗</Text>
+                </Pressable>
+              ) : null}
+              <View style={styles.detailAction}>
+                <PrimaryButton label="Edit memory" onPress={() => setEditing(true)} />
+              </View>
+            </View>
+          ) : (
+            <View style={styles.editorBody}>
+              <View style={styles.editorSection}>
+                <Text style={styles.editorLabel}>Your note</Text>
+                <TextInput
+                  value={note}
+                  onChangeText={setNote}
+                  placeholder="What do you want to remember?"
+                  placeholderTextColor="#8B8B85"
+                  multiline
+                  style={styles.editNoteInput}
+                />
+              </View>
+
+              <View style={styles.editorSection}>
+                <Text style={styles.editorLabel}>Tags</Text>
+                <Text style={styles.editorHelp}>Tap one to remove it.</Text>
+                {tags.length ? (
+                  <View style={styles.editorChipWrap}>
+                    {tags.map((tag) => (
+                      <Pressable key={tag} onPress={() => setTags((current) => current.filter((item) => item !== tag))}>
+                        <Text style={styles.editTagChip}>#{tag}  ×</Text>
+                      </Pressable>
+                    ))}
+                  </View>
+                ) : null}
+                <View style={styles.editorAddRow}>
+                  <TextInput
+                    value={tagDraft}
+                    onChangeText={setTagDraft}
+                    onSubmitEditing={() => addTag()}
+                    placeholder="Add a tag"
+                    placeholderTextColor="#8B8B85"
+                    autoCapitalize="none"
+                    returnKeyType="done"
+                    style={styles.editorSmallInput}
+                  />
+                  <Pressable onPress={() => addTag()} disabled={!normalizeTag(tagDraft)} style={styles.editorAddButton}>
+                    <Ionicons name="add" size={20} color="#FFFFFF" />
+                  </Pressable>
+                </View>
+                {usedTagSuggestions.length ? (
+                  <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.editorSuggestionRow}>
+                    {usedTagSuggestions.map((tag) => (
+                      <Pressable key={tag} onPress={() => addTag(tag)} style={styles.editorSuggestionChip}>
+                        <Text style={styles.editorSuggestionText}>#{tag}</Text>
+                      </Pressable>
+                    ))}
+                  </ScrollView>
+                ) : null}
+              </View>
+
+              <View style={styles.editorSection}>
+                <Text style={styles.editorLabel}>Mood</Text>
+                <Text style={styles.editorHelp}>Choose as many as fit.</Text>
+                <View style={styles.editorChipWrap}>
+                  {moodChoices.map((mood) => {
+                    const selected = moods.includes(mood);
+                    return (
+                      <Pressable
+                        key={mood}
+                        onPress={() => setMoods((current) => selected ? current.filter((item) => item !== mood) : [...current, mood])}
+                        style={[styles.choiceChip, selected && styles.choiceChipSelected]}
+                      >
+                        <Text style={[styles.choiceChipText, selected && styles.choiceChipTextSelected]}>{mood}</Text>
+                      </Pressable>
+                    );
+                  })}
+                </View>
+                <View style={styles.editorAddRow}>
+                  <TextInput
+                    value={moodDraft}
+                    onChangeText={setMoodDraft}
+                    onSubmitEditing={() => addMood()}
+                    placeholder="Add your own mood"
+                    placeholderTextColor="#8B8B85"
+                    returnKeyType="done"
+                    style={styles.editorSmallInput}
+                  />
+                  <Pressable onPress={() => addMood()} disabled={!normalizeMood(moodDraft)} style={styles.editorAddButton}>
+                    <Ionicons name="add" size={20} color="#FFFFFF" />
+                  </Pressable>
+                </View>
+              </View>
+
+              <View style={styles.editorSection}>
+                <Text style={styles.editorLabel}>Where does this belong?</Text>
+                <Text style={styles.editorHelp}>Online memories will stay out of nearby-place results.</Text>
+                <View style={styles.editorChipWrap}>
+                  {CONTEXT_OPTIONS.map((option) => {
+                    const selected = contextType === option.value;
+                    return (
+                      <Pressable
+                        key={option.value}
+                        onPress={() => setContextType(option.value)}
+                        style={[styles.choiceChip, selected && styles.contextChoiceSelected]}
+                      >
+                        <Ionicons name={option.icon} size={15} color={selected ? '#765D45' : '#666660'} />
+                        <Text style={[styles.choiceChipText, selected && styles.contextChoiceText]}>{option.label}</Text>
+                      </Pressable>
+                    );
+                  })}
+                </View>
+              </View>
+
+              <View style={styles.editorSection}>
+                <Text style={styles.editorLabel}>Shopping stage</Text>
+                <Text style={styles.editorHelp}>Optional — change it as the story moves along.</Text>
+                <View style={styles.editorChipWrap}>
+                  {SHOPPING_OPTIONS.map((option) => {
+                    const selected = shoppingStatus === option.value;
+                    return (
+                      <Pressable
+                        key={option.value}
+                        onPress={() => setShoppingStatus(option.value)}
+                        style={[styles.choiceChip, selected && styles.statusChoiceSelected]}
+                      >
+                        <Text style={[styles.choiceChipText, selected && styles.statusChoiceText]}>{option.label}</Text>
+                      </Pressable>
+                    );
+                  })}
+                  {shoppingStatus ? (
+                    <Pressable onPress={() => setShoppingStatus(null)} style={styles.clearChoiceChip}>
+                      <Text style={styles.clearChoiceText}>Clear</Text>
+                    </Pressable>
+                  ) : null}
+                </View>
+              </View>
+
+              {saveError ? <Text style={styles.editorError}>{saveError}</Text> : null}
+              <PrimaryButton label={saving ? 'Saving…' : 'Save changes'} onPress={saveMemory} disabled={saving} />
+              <Pressable style={styles.cancelEditButton} onPress={() => setEditing(false)} disabled={saving}>
+                <Text style={styles.cancelEditText}>Cancel</Text>
+              </Pressable>
+            </View>
+          )}
+        </ScrollView>
+      </KeyboardAvoidingView>
     </View>
   );
 }

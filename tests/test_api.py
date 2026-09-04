@@ -61,8 +61,8 @@ def _fetch_memory_row(memory_id: int):
     try:
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT id, text_note, user_note, bepo_summary, tags, mood, place_hint, text_emb, "
-            "note_created_at, note_updated_at "
+            "SELECT id, text_note, user_note, bepo_summary, tags, mood, place_hint, context_type, "
+            "shopping_status, shopping_status_updated_at, text_emb, note_created_at, note_updated_at "
             "FROM memories WHERE id = ?",
             (memory_id,),
         )
@@ -131,6 +131,9 @@ class TestListMemories:
         assert "taken_at" in m
         assert "note_created_at" in m
         assert "location_source" in m
+        assert m["context_type"] == "unknown"
+        assert m["shopping_status"] is None
+        assert m["shopping_status_updated_at"] is None
 
     def test_old_minimal_post_memory_still_works(self, client):
         r = client.post(
@@ -151,6 +154,8 @@ class TestListMemories:
         assert memory["mood"] is None
         assert memory["tags"] is None
         assert memory["place_hint"] is None
+        assert memory["context_type"] == "unknown"
+        assert memory["shopping_status"] is None
 
     def test_gallery_is_ordered_by_event_date_when_known(self, client):
         newer_event = client.post(
@@ -194,6 +199,8 @@ class TestGetMemory:
         assert data["tags"] is None
         assert data["mood"] is None
         assert data["place_hint"] is None
+        assert data["context_type"] == "physical"
+        assert data["shopping_status"] is None
 
     def test_returns_new_metadata_fields(self, client):
         resp = client.post(
@@ -218,6 +225,34 @@ class TestGetMemory:
         assert data["tags"] == "cafe,cat,cozy"
         assert data["mood"] == "calm"
         assert data["place_hint"] == "near red couch"
+
+    def test_accepts_online_context_and_initial_shopping_status(self, client):
+        resp = client.post(
+            "/memory",
+            files={"photo": ("img.jpg", _tiny_jpeg(), "image/jpeg")},
+            data={"note": "striped cardigan", "context_type": "online", "shopping_status": "want"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["context_type"] == "online"
+        assert data["shopping_status"] == "want"
+        assert data["shopping_status_updated_at"] is not None
+
+        history = client.get(f"/memory/{data['memory_id']}/status-history")
+        assert history.status_code == 200
+        assert history.json() == [{"status": "want", "changed_at": data["shopping_status_updated_at"]}]
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [("context_type", "somewhere"), ("shopping_status", "maybe")],
+    )
+    def test_rejects_invalid_structured_metadata(self, client, field, value):
+        resp = client.post(
+            "/memory",
+            files={"photo": ("img.jpg", _tiny_jpeg(), "image/jpeg")},
+            data={field: value},
+        )
+        assert resp.status_code == 422
 
     def test_keeps_photo_time_separate_from_added_and_note_times(self, client):
         resp = client.post(
@@ -296,6 +331,57 @@ class TestPatchMemoryMetadata:
         assert data["place_hint"] == "near the fountain"
         assert "text_emb" not in data
         assert "image_emb" not in data
+
+    def test_updates_context_and_tracks_shopping_status_history(self, client):
+        create_r = client.post(
+            "/memory",
+            files={"photo": ("img.jpg", _tiny_jpeg(), "image/jpeg")},
+            data={"note": "a lamp", "shopping_status": "want"},
+        )
+        memory_id = create_r.json()["memory_id"]
+
+        patch_r = client.patch(
+            f"/memory/{memory_id}/metadata",
+            json={"context_type": "online", "shopping_status": "bought"},
+        )
+
+        assert patch_r.status_code == 200
+        data = patch_r.json()
+        assert data["context_type"] == "online"
+        assert data["shopping_status"] == "bought"
+        assert data["shopping_status_updated_at"] is not None
+
+        history = client.get(f"/memory/{memory_id}/status-history").json()
+        assert [entry["status"] for entry in history] == ["want", "bought"]
+
+    def test_clearing_shopping_status_is_recorded(self, client):
+        create_r = client.post(
+            "/memory",
+            files={"photo": ("img.jpg", _tiny_jpeg(), "image/jpeg")},
+            data={"shopping_status": "ordered"},
+        )
+        memory_id = create_r.json()["memory_id"]
+
+        patch_r = client.patch(f"/memory/{memory_id}/metadata", json={"shopping_status": None})
+
+        assert patch_r.status_code == 200
+        assert patch_r.json()["shopping_status"] is None
+        history = client.get(f"/memory/{memory_id}/status-history").json()
+        assert [entry["status"] for entry in history] == ["ordered", None]
+
+    @pytest.mark.parametrize(
+        ("payload", "field"),
+        [({"context_type": "nearby"}, "context_type"), ({"shopping_status": "soon"}, "shopping_status")],
+    )
+    def test_rejects_invalid_edit_values(self, client, payload, field):
+        create_r = client.post(
+            "/memory",
+            files={"photo": ("img.jpg", _tiny_jpeg(), "image/jpeg")},
+        )
+        memory_id = create_r.json()["memory_id"]
+        patch_r = client.patch(f"/memory/{memory_id}/metadata", json=payload)
+        assert patch_r.status_code == 422
+        assert field in str(patch_r.json())
 
     def test_records_when_a_note_is_added_later(self, client):
         create_r = client.post(
@@ -704,14 +790,21 @@ class TestInitDbMigration:
                 "user_note", "bepo_summary", "tags", "mood", "place_hint",
                 "taken_at", "taken_at_source", "location_source",
                 "note_created_at", "note_updated_at",
+                "context_type", "shopping_status", "shopping_status_updated_at",
             }.issubset(columns)
 
-            cursor2.execute("SELECT text_note, lat, lon, taken_at, note_created_at, note_updated_at FROM memories")
+            cursor2.execute(
+                "SELECT text_note, lat, lon, taken_at, note_created_at, note_updated_at, context_type "
+                "FROM memories"
+            )
             row = cursor2.fetchone()
             assert row == (
                 "legacy note", 1.0, 2.0, None,
                 "2026-01-01T00:00:00", "2026-01-01T00:00:00",
+                "physical",
             )
+            cursor2.execute("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'memory_status_history'")
+            assert cursor2.fetchone() is not None
         finally:
             conn2.close()
 

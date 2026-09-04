@@ -84,7 +84,12 @@ METADATA_FIELDS = (
     "tags",
     "mood",
     "place_hint",
+    "context_type",
+    "shopping_status",
 )
+
+CONTEXT_TYPES = {"physical", "online", "mixed", "unknown"}
+SHOPPING_STATUSES = {"want", "ordered", "bought", "returned", "no_longer_want"}
 
 
 class MemoryMetadataUpdate(BaseModel):
@@ -94,6 +99,28 @@ class MemoryMetadataUpdate(BaseModel):
     tags: Optional[str] = None
     mood: Optional[str] = None
     place_hint: Optional[str] = None
+    context_type: Optional[str] = None
+    shopping_status: Optional[str] = None
+
+    @field_validator("context_type")
+    @classmethod
+    def valid_context_type(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return value
+        cleaned = value.strip().lower()
+        if cleaned not in CONTEXT_TYPES:
+            raise ValueError("context_type must be physical, online, mixed, or unknown")
+        return cleaned
+
+    @field_validator("shopping_status")
+    @classmethod
+    def valid_shopping_status(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return value
+        cleaned = value.strip().lower()
+        if cleaned not in SHOPPING_STATUSES:
+            raise ValueError("shopping_status must be want, ordered, bought, returned, or no_longer_want")
+        return cleaned
 
 
 class ChatRequest(BaseModel):
@@ -147,7 +174,10 @@ def init_db():
             text_note TEXT,
             text_emb BLOB,
             note_created_at DATETIME,
-            note_updated_at DATETIME
+            note_updated_at DATETIME,
+            context_type TEXT NOT NULL DEFAULT 'unknown',
+            shopping_status TEXT,
+            shopping_status_updated_at DATETIME
         )
     """)
 
@@ -165,10 +195,33 @@ def init_db():
         "location_source": "ALTER TABLE memories ADD COLUMN location_source TEXT",
         "note_created_at": "ALTER TABLE memories ADD COLUMN note_created_at DATETIME",
         "note_updated_at": "ALTER TABLE memories ADD COLUMN note_updated_at DATETIME",
+        "context_type": "ALTER TABLE memories ADD COLUMN context_type TEXT NOT NULL DEFAULT 'unknown'",
+        "shopping_status": "ALTER TABLE memories ADD COLUMN shopping_status TEXT",
+        "shopping_status_updated_at": "ALTER TABLE memories ADD COLUMN shopping_status_updated_at DATETIME",
     }
     for column, statement in migration_alter_statements.items():
         if column not in existing_columns:
             cursor.execute(statement)
+
+    # Older memories with coordinates are physical by default. Memories without
+    # coordinates remain unknown until their owner labels them.
+    if "context_type" not in existing_columns:
+        cursor.execute("""
+            UPDATE memories
+            SET context_type = 'physical'
+            WHERE lat IS NOT NULL AND lon IS NOT NULL
+        """)
+    cursor.execute("UPDATE memories SET context_type = 'unknown' WHERE context_type IS NULL")
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS memory_status_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            memory_id INTEGER NOT NULL,
+            status TEXT,
+            changed_at DATETIME NOT NULL,
+            FOREIGN KEY(memory_id) REFERENCES memories(id) ON DELETE CASCADE
+        )
+    """)
 
     # Existing notes were written when their memory was first added. Preserve
     # that useful history while leaving the unknown event date untouched.
@@ -352,6 +405,9 @@ def row_to_memory_response(row: sqlite3.Row) -> dict:
         "tags": row["tags"],
         "mood": row["mood"],
         "place_hint": row["place_hint"],
+        "context_type": row["context_type"],
+        "shopping_status": row["shopping_status"],
+        "shopping_status_updated_at": row["shopping_status_updated_at"],
         "lat": lat,
         "lon": lon,
         "location_source": row["location_source"],
@@ -383,7 +439,8 @@ def fetch_memory_by_id(memory_id: int) -> Optional[sqlite3.Row]:
         cursor.execute(
             "SELECT id, ts, taken_at, taken_at_source, lat, lon, location_source, "
             "image_path, image_emb, text_note, text_emb, note_created_at, note_updated_at, "
-            "user_note, bepo_summary, tags, mood, place_hint "
+            "user_note, bepo_summary, tags, mood, place_hint, context_type, shopping_status, "
+            "shopping_status_updated_at "
             "FROM memories WHERE id = ?",
             (memory_id,),
         )
@@ -470,7 +527,8 @@ def search_memory_matches(query: str, top_k: int) -> list:
         cursor.execute(
             "SELECT id, ts, taken_at, taken_at_source, lat, lon, location_source, "
             "image_path, image_emb, text_note, text_emb, note_created_at, note_updated_at, "
-            "user_note, bepo_summary, tags, mood, place_hint "
+            "user_note, bepo_summary, tags, mood, place_hint, context_type, shopping_status, "
+            "shopping_status_updated_at "
             "FROM memories"
         )
         rows = cursor.fetchall()
@@ -510,6 +568,9 @@ def search_memory_matches(query: str, top_k: int) -> list:
             "tags": row["tags"],
             "mood": row["mood"],
             "place_hint": row["place_hint"],
+            "context_type": row["context_type"],
+            "shopping_status": row["shopping_status"],
+            "shopping_status_updated_at": row["shopping_status_updated_at"],
             "lat": lat,
             "lon": lon,
             "location_source": row["location_source"],
@@ -530,7 +591,7 @@ def build_chat_answer(top: dict) -> str:
     else:
         sentences.append("You may mean this memory.")
 
-    description = top.get("bepo_summary") or top.get("user_note") or top.get("note")
+    description = top.get("user_note") or top.get("bepo_summary") or top.get("note")
     if description:
         sentences.append(f'I recall: "{description}".')
 
@@ -559,6 +620,8 @@ async def create_memory(
     tags: Optional[str] = Form(None),
     mood: Optional[str] = Form(None),
     place_hint: Optional[str] = Form(None),
+    context_type: Optional[str] = Form(None),
+    shopping_status: Optional[str] = Form(None),
     taken_at: Optional[str] = Form(None),
     taken_at_source: Optional[str] = Form(None),
     lat: Optional[float] = Form(None),
@@ -583,6 +646,18 @@ async def create_memory(
             raise HTTPException(status_code=422, detail="taken_at_source must be photo, camera, or manual")
         if location_source not in {None, "photo", "current", "manual"}:
             raise HTTPException(status_code=422, detail="location_source must be photo, current, or manual")
+        normalized_context = context_type.strip().lower() if context_type else None
+        if normalized_context is not None and normalized_context not in CONTEXT_TYPES:
+            raise HTTPException(status_code=422, detail="context_type must be physical, online, mixed, or unknown")
+        normalized_status = shopping_status.strip().lower() if shopping_status else None
+        if normalized_status is not None and normalized_status not in SHOPPING_STATUSES:
+            raise HTTPException(
+                status_code=422,
+                detail="shopping_status must be want, ordered, bought, returned, or no_longer_want",
+            )
+        resolved_context = normalized_context or (
+            "physical" if lat is not None and lon is not None else "unknown"
+        )
 
         # The server timestamp records when the memory/note was added. The
         # optional photo timestamp records when the event itself happened.
@@ -613,9 +688,10 @@ async def create_memory(
                 INSERT INTO memories (
                     ts, taken_at, taken_at_source, lat, lon, location_source,
                     image_path, image_emb, text_note, text_emb, note_created_at, note_updated_at,
-                    user_note, bepo_summary, tags, mood, place_hint
+                    user_note, bepo_summary, tags, mood, place_hint, context_type,
+                    shopping_status, shopping_status_updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 timestamp_iso,
                 parsed_taken_at,
@@ -634,8 +710,16 @@ async def create_memory(
                 tags,
                 mood,
                 place_hint,
+                resolved_context,
+                normalized_status,
+                timestamp_iso if normalized_status is not None else None,
             ))
             memory_id = cursor.lastrowid
+            if normalized_status is not None:
+                cursor.execute(
+                    "INSERT INTO memory_status_history (memory_id, status, changed_at) VALUES (?, ?, ?)",
+                    (memory_id, normalized_status, timestamp_iso),
+                )
             conn.commit()
         finally:
             conn.close()
@@ -657,6 +741,9 @@ async def create_memory(
             "tags": tags,
             "mood": mood,
             "place_hint": place_hint,
+            "context_type": resolved_context,
+            "shopping_status": normalized_status,
+            "shopping_status_updated_at": timestamp_iso if normalized_status is not None else None,
             "lat": lat,
             "lon": lon,
             "location_source": location_source if lat is not None and lon is not None else None,
@@ -684,8 +771,12 @@ async def update_memory_metadata(memory_id: int, payload: MemoryMetadataUpdate):
         "tags": existing_row["tags"],
         "mood": existing_row["mood"],
         "place_hint": existing_row["place_hint"],
+        "context_type": existing_row["context_type"],
+        "shopping_status": existing_row["shopping_status"],
     }
     merged_values.update(updates)
+    if merged_values["context_type"] is None:
+        merged_values["context_type"] = "unknown"
 
     note_created_at = existing_row["note_created_at"]
     note_updated_at = existing_row["note_updated_at"]
@@ -695,6 +786,14 @@ async def update_memory_metadata(memory_id: int, payload: MemoryMetadataUpdate):
             merged_values["text_note"], merged_values["user_note"]
         ) is not None:
             note_created_at = note_updated_at
+
+    shopping_status_changed = (
+        "shopping_status" in updates
+        and merged_values["shopping_status"] != existing_row["shopping_status"]
+    )
+    shopping_status_updated_at = existing_row["shopping_status_updated_at"]
+    if shopping_status_changed:
+        shopping_status_updated_at = datetime.now().astimezone().isoformat()
 
     combined_text = build_combined_text(
         merged_values["text_note"],
@@ -716,6 +815,7 @@ async def update_memory_metadata(memory_id: int, payload: MemoryMetadataUpdate):
             """
             UPDATE memories
             SET text_note = ?, user_note = ?, bepo_summary = ?, tags = ?, mood = ?, place_hint = ?,
+                context_type = ?, shopping_status = ?, shopping_status_updated_at = ?,
                 text_emb = ?, note_created_at = ?, note_updated_at = ?
             WHERE id = ?
             """,
@@ -726,16 +826,25 @@ async def update_memory_metadata(memory_id: int, payload: MemoryMetadataUpdate):
                 merged_values["tags"],
                 merged_values["mood"],
                 merged_values["place_hint"],
+                merged_values["context_type"],
+                merged_values["shopping_status"],
+                shopping_status_updated_at,
                 serialized_text_emb,
                 note_created_at,
                 note_updated_at,
                 memory_id,
             ),
         )
+        if shopping_status_changed:
+            cursor.execute(
+                "INSERT INTO memory_status_history (memory_id, status, changed_at) VALUES (?, ?, ?)",
+                (memory_id, merged_values["shopping_status"], shopping_status_updated_at),
+            )
         conn.commit()
         cursor.execute(
             "SELECT id, ts, taken_at, taken_at_source, lat, lon, location_source, image_path, "
-            "text_note, note_created_at, note_updated_at, user_note, bepo_summary, tags, mood, place_hint "
+            "text_note, note_created_at, note_updated_at, user_note, bepo_summary, tags, mood, place_hint, "
+            "context_type, shopping_status, shopping_status_updated_at "
             "FROM memories WHERE id = ?",
             (memory_id,),
         )
@@ -821,7 +930,8 @@ async def list_memories():
         cursor = conn.cursor()
         cursor.execute(
             "SELECT id, ts, taken_at, taken_at_source, lat, lon, location_source, image_path, "
-            "text_note, note_created_at, note_updated_at, user_note, bepo_summary, tags, mood, place_hint "
+            "text_note, note_created_at, note_updated_at, user_note, bepo_summary, tags, mood, place_hint, "
+            "context_type, shopping_status, shopping_status_updated_at "
             "FROM memories ORDER BY COALESCE(taken_at, ts) DESC"
         )
         rows = cursor.fetchall()
@@ -840,6 +950,24 @@ async def get_memory(memory_id: int):
     return row_to_memory_response(row)
 
 
+@router.get("/memory/{memory_id}/status-history")
+async def get_memory_status_history(memory_id: int):
+    """Return shopping-status changes for a memory, oldest first."""
+    if fetch_memory_by_id(memory_id) is None:
+        raise HTTPException(status_code=404, detail=f"Memory {memory_id} not found")
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT status, changed_at FROM memory_status_history "
+            "WHERE memory_id = ? ORDER BY changed_at ASC, id ASC",
+            (memory_id,),
+        )
+        return [dict(row) for row in cursor.fetchall()]
+    finally:
+        conn.close()
+
+
 @router.get("/image/{memory_id}")
 async def get_image(memory_id: int):
     """Serve the image file associated with a memory. Returns 404 if not found."""
@@ -856,13 +984,14 @@ async def root():
     """Root endpoint with API information"""
     return {
         "app": "Bepo",
-        "version": "0.6",
+        "version": "0.7",
         "description": "Memory storage and search with image and text embeddings",
         "endpoints": {
             "POST /memory": "Store a new memory with photo, note, and GPS",
             "PATCH /memory/{id}/metadata": "Update editable memory metadata and refresh text embeddings",
             "GET /memories": "List all memories, newest first",
             "GET /memory/{id}": "Get a single memory by id",
+            "GET /memory/{id}/status-history": "Show shopping-status changes for a memory",
             "GET /image/{id}": "Serve the image for a memory",
             "POST /search": "Search memories by text query (supports top_k parameter)",
             "POST /chat": "Ask a natural question about saved memories",
