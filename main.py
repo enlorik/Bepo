@@ -1,8 +1,10 @@
 import os
+import re
 import secrets
 import sqlite3
 import io
 from datetime import datetime
+from math import atan2, cos, radians, sin, sqrt
 from typing import Optional
 from contextlib import asynccontextmanager
 import numpy as np
@@ -126,6 +128,8 @@ class MemoryMetadataUpdate(BaseModel):
 class ChatRequest(BaseModel):
     message: str
     top_k: int = Field(default=3, ge=1, le=10)
+    lat: Optional[float] = Field(default=None, ge=-90, le=90)
+    lon: Optional[float] = Field(default=None, ge=-180, le=180)
 
     @field_validator("message")
     @classmethod
@@ -517,10 +521,123 @@ def deserialize_embedding(data: bytes) -> np.ndarray:
     return np.load(buffer)
 
 
-def search_memory_matches(query: str, top_k: int) -> list:
-    """Return up to top_k scored memory dicts for query, sorted by score descending."""
-    query_emb = get_text_embedding(query)
+def split_metadata_values(value: Optional[str]) -> set[str]:
+    """Return normalized comma-separated metadata values."""
+    if value is None:
+        return set()
+    return {part.strip().casefold() for part in value.split(",") if part.strip()}
 
+
+def remove_query_phrase(value: str, pattern: str) -> str:
+    """Remove a recognized filter phrase while preserving the remaining query."""
+    return re.sub(pattern, " ", value, flags=re.IGNORECASE)
+
+
+def parse_memory_query(query: str, known_moods: set[str]) -> dict:
+    """Extract exact filters from a conversational memory query."""
+    working = query.casefold()
+    hashtags = [match.group(1).casefold() for match in re.finditer(r"(?<!\S)#([\w-]+)", working)]
+    working = re.sub(r"(?<!\S)#[\w-]+", " ", working)
+
+    status_aliases = {
+        "want": "want",
+        "wishlist": "want",
+        "to-buy": "want",
+        "ordered": "ordered",
+        "bought": "bought",
+        "purchased": "bought",
+        "returned": "returned",
+        "refunded": "returned",
+        "no-longer-want": "no_longer_want",
+    }
+    context_aliases = {
+        "online": "online",
+        "digital": "online",
+        "physical": "physical",
+        "irl": "physical",
+        "mixed": "mixed",
+    }
+
+    tags = []
+    moods = []
+    context_type = None
+    shopping_status = None
+    for hashtag in hashtags:
+        if hashtag in status_aliases:
+            shopping_status = status_aliases[hashtag]
+        elif hashtag in context_aliases:
+            context_type = context_aliases[hashtag]
+        elif hashtag.replace("-", " ") in known_moods:
+            moods.append(hashtag.replace("-", " "))
+        else:
+            tags.append(hashtag)
+
+    nearby = bool(re.search(r"\b(?:nearby|closest)\b|\bnear\s+me\b", working, flags=re.IGNORECASE))
+    working = remove_query_phrase(working, r"\b(?:nearby|closest)\b|\bnear\s+me\b")
+
+    status_patterns = [
+        ("no_longer_want", r"\b(?:no\s+longer\s+want|do\s+not\s+want|don't\s+want)\b"),
+        ("returned", r"\b(?:returned|refunded)\b"),
+        ("bought", r"\b(?:bought|purchased)\b"),
+        ("ordered", r"\bordered\b"),
+        ("want", r"\b(?:wishlist|to\s+buy)\b"),
+    ]
+    for status, pattern in status_patterns:
+        if re.search(pattern, working, flags=re.IGNORECASE):
+            shopping_status = status
+            working = remove_query_phrase(working, pattern)
+            break
+    if shopping_status is None and ("shopping" in tags or not working.strip().replace("?", "")):
+        if re.search(r"\bwant\b", working, flags=re.IGNORECASE):
+            shopping_status = "want"
+            working = remove_query_phrase(working, r"\bwant\b")
+
+    context_patterns = [
+        ("mixed", r"\b(?:mixed|both)\b"),
+        ("online", r"\b(?:online|digital)\b"),
+        ("physical", r"\b(?:in\s+person|physical|irl)\b"),
+    ]
+    if context_type is None:
+        for context, pattern in context_patterns:
+            if re.search(pattern, working, flags=re.IGNORECASE):
+                context_type = context
+                working = remove_query_phrase(working, pattern)
+                break
+
+    for mood in sorted(known_moods, key=len, reverse=True):
+        pattern = rf"(?<![\w-]){re.escape(mood)}(?![\w-])"
+        if re.search(pattern, working, flags=re.IGNORECASE):
+            moods.append(mood)
+            working = remove_query_phrase(working, pattern)
+
+    semantic_query = re.sub(r"\s+", " ", working).strip(" .,?!")
+    return {
+        "tags": list(dict.fromkeys(tags)),
+        "moods": list(dict.fromkeys(moods)),
+        "context_type": context_type,
+        "shopping_status": shopping_status,
+        "nearby": nearby,
+        "semantic_query": semantic_query,
+    }
+
+
+def haversine_distance_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Return the great-circle distance between two coordinates in kilometers."""
+    earth_radius_km = 6371.0088
+    lat1_r, lon1_r, lat2_r, lon2_r = map(radians, (lat1, lon1, lat2, lon2))
+    lat_delta = lat2_r - lat1_r
+    lon_delta = lon2_r - lon1_r
+    value = sin(lat_delta / 2) ** 2 + cos(lat1_r) * cos(lat2_r) * sin(lon_delta / 2) ** 2
+    return earth_radius_km * 2 * atan2(sqrt(value), sqrt(max(0.0, 1 - value)))
+
+
+def search_memory_matches_with_filters(
+    query: str,
+    top_k: int,
+    current_lat: Optional[float] = None,
+    current_lon: Optional[float] = None,
+) -> tuple[list, dict, bool]:
+    """Return matches, parsed filters, and whether a nearby query needs GPS."""
     conn = get_db_connection()
     try:
         cursor = conn.cursor()
@@ -536,15 +653,55 @@ def search_memory_matches(query: str, top_k: int) -> list:
         conn.close()
 
     if not rows:
-        return []
+        return [], parse_memory_query(query, set()), False
+
+    known_moods = {
+        mood
+        for row in rows
+        for mood in split_metadata_values(row["mood"])
+    }
+    known_moods.update({"calm", "cozy", "happy", "excited", "nostalgic", "safe", "romantic", "sad", "anxious"})
+    filters = parse_memory_query(query, known_moods)
+    needs_location = filters["nearby"] and (current_lat is None or current_lon is None)
+    if needs_location:
+        return [], filters, True
+
+    semantic_query = filters["semantic_query"]
+    query_emb = get_text_embedding(semantic_query) if semantic_query else None
 
     scored = []
     for row in rows:
-        image_emb = deserialize_embedding(row["image_emb"])
-        image_score = cosine_similarity(query_emb, image_emb)
+        row_tags = split_metadata_values(row["tags"])
+        if not set(filters["tags"]).issubset(row_tags):
+            continue
+        row_moods = split_metadata_values(row["mood"])
+        if not set(filters["moods"]).issubset(row_moods):
+            continue
+        if filters["shopping_status"] and row["shopping_status"] != filters["shopping_status"]:
+            continue
+
+        row_context = row["context_type"] or "unknown"
+        context_filter = filters["context_type"]
+        if context_filter == "online" and row_context not in {"online", "mixed"}:
+            continue
+        if context_filter == "physical" and row_context not in {"physical", "mixed"}:
+            continue
+        if context_filter == "mixed" and row_context != "mixed":
+            continue
+        if filters["nearby"] and (
+            row_context not in {"physical", "mixed"}
+            or row["lat"] is None
+            or row["lon"] is None
+        ):
+            continue
+
+        image_score = 1.0
+        if query_emb is not None:
+            image_emb = deserialize_embedding(row["image_emb"])
+            image_score = cosine_similarity(query_emb, image_emb)
 
         text_score = -1.0
-        if row["text_emb"] is not None:
+        if query_emb is not None and row["text_emb"] is not None:
             text_emb_arr = deserialize_embedding(row["text_emb"])
             text_score = cosine_similarity(query_emb, text_emb_arr)
 
@@ -552,6 +709,9 @@ def search_memory_matches(query: str, top_k: int) -> list:
         memory_id = row["id"]
         lat = row["lat"]
         lon = row["lon"]
+        distance_km = None
+        if current_lat is not None and current_lon is not None and lat is not None and lon is not None:
+            distance_km = round(haversine_distance_km(current_lat, current_lon, lat, lon), 2)
         scored.append({
             "id": memory_id,
             "timestamp": row["ts"],
@@ -575,11 +735,39 @@ def search_memory_matches(query: str, top_k: int) -> list:
             "lon": lon,
             "location_source": row["location_source"],
             "map_url": build_map_url(lat, lon),
+            "distance_km": distance_km,
             "score": score,
         })
 
-    scored.sort(key=lambda x: x["score"], reverse=True)
-    return scored[:top_k]
+    if filters["nearby"]:
+        scored.sort(key=lambda item: (item["distance_km"], -item["score"]))
+    elif semantic_query:
+        scored.sort(key=lambda item: item["score"], reverse=True)
+    else:
+        scored.sort(key=lambda item: item["taken_at"] or item["timestamp"], reverse=True)
+    return scored[:top_k], filters, False
+
+
+def search_memory_matches(query: str, top_k: int) -> list:
+    """Backward-compatible semantic/structured search helper."""
+    matches, _, _ = search_memory_matches_with_filters(query, top_k)
+    return matches
+
+
+def public_memory_filters(filters: dict) -> dict:
+    """Return only user-facing filters, omitting internal semantic-query text."""
+    return {key: value for key, value in filters.items() if key != "semantic_query" and value not in (None, [], False)}
+
+
+def build_filtered_chat_answer(filters: dict, count: int, top: Optional[dict] = None) -> str:
+    """Describe an exact filtered result set in friendly language."""
+    nearby = filters.get("nearby")
+    noun = "memory" if count == 1 else "memories"
+    ordering = " nearby, closest first" if nearby else ""
+    answer = f"I found {count} matching {noun}{ordering}."
+    if top is not None and count == 1:
+        answer = f"{answer} {build_chat_answer(top)}"
+    return answer
 
 
 def build_chat_answer(top: dict) -> str:
@@ -858,6 +1046,8 @@ async def update_memory_metadata(memory_id: int, payload: MemoryMetadataUpdate):
 async def search_memories(
     query: str = Form(...),
     top_k: int = Form(5),
+    lat: Optional[float] = Form(None),
+    lon: Optional[float] = Form(None),
 ):
     """
     Search memories by text query.
@@ -867,14 +1057,29 @@ async def search_memories(
         raise HTTPException(status_code=422, detail="query must not be empty or whitespace")
     if not (1 <= top_k <= 20):
         raise HTTPException(status_code=422, detail="top_k must be between 1 and 20")
+    if lat is not None and not (-90 <= lat <= 90):
+        raise HTTPException(status_code=422, detail="lat must be between -90 and 90")
+    if lon is not None and not (-180 <= lon <= 180):
+        raise HTTPException(status_code=422, detail="lon must be between -180 and 180")
 
     try:
-        matches = search_memory_matches(query.strip(), top_k)
+        matches, filters, needs_location = search_memory_matches_with_filters(
+            query.strip(), top_k, lat, lon
+        )
+
+        if needs_location:
+            return {
+                "status": "needs_location",
+                "message": "Current location is needed for nearby results",
+                "filters": public_memory_filters(filters),
+                "matches": [],
+            }
 
         if not matches:
             return {
                 "status": "no_results",
                 "message": "No memories found in database",
+                "filters": public_memory_filters(filters),
                 "matches": [],
             }
 
@@ -882,6 +1087,7 @@ async def search_memories(
             "status": "success",
             "query": query,
             "count": len(matches),
+            "filters": public_memory_filters(filters),
             "matches": matches,
         }
 
@@ -898,23 +1104,38 @@ async def chat(request: ChatRequest):
     Returns a simple deterministic answer built from the top matching memory.
     """
     try:
-        matches = search_memory_matches(request.message.strip(), request.top_k)
+        matches, filters, needs_location = search_memory_matches_with_filters(
+            request.message.strip(), request.top_k, request.lat, request.lon
+        )
+        applied_filters = public_memory_filters(filters)
+
+        if needs_location:
+            return {
+                "status": "needs_location",
+                "message": request.message,
+                "answer": "I need your current location to sort these memories nearby. You can allow location access and try again.",
+                "filters": applied_filters,
+                "memories": [],
+            }
 
         if not matches:
             return {
                 "status": "no_results",
                 "message": request.message,
-                "answer": "I do not have any memories saved yet.",
+                "answer": "I could not find any memories matching those details." if applied_filters
+                else "I do not have any memories saved yet.",
+                "filters": applied_filters,
                 "memories": [],
             }
 
-        answer = build_chat_answer(matches[0])
+        answer = build_filtered_chat_answer(filters, len(matches), matches[0]) if applied_filters else build_chat_answer(matches[0])
 
         return {
             "status": "success",
             "message": request.message,
             "answer": answer,
             "count": len(matches),
+            "filters": applied_filters,
             "memories": matches,
         }
 
@@ -984,7 +1205,7 @@ async def root():
     """Root endpoint with API information"""
     return {
         "app": "Bepo",
-        "version": "0.7",
+        "version": "0.8",
         "description": "Memory storage and search with image and text embeddings",
         "endpoints": {
             "POST /memory": "Store a new memory with photo, note, and GPS",
@@ -993,8 +1214,8 @@ async def root():
             "GET /memory/{id}": "Get a single memory by id",
             "GET /memory/{id}/status-history": "Show shopping-status changes for a memory",
             "GET /image/{id}": "Serve the image for a memory",
-            "POST /search": "Search memories by text query (supports top_k parameter)",
-            "POST /chat": "Ask a natural question about saved memories",
+            "POST /search": "Search with exact tags, moods, context, shopping stage, and nearby distance",
+            "POST /chat": "Ask naturally with structured filters and optional current location",
         },
     }
 

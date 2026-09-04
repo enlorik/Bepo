@@ -53,10 +53,19 @@ type Memory = {
   location_source?: 'photo' | 'current' | 'manual' | null;
   image_url: string;
   map_url: string | null;
+  distance_km?: number | null;
   score?: number;
 };
 
-type ChatResponse = { status: string; answer: string; memories: Memory[] };
+type MemoryFilters = {
+  tags?: string[];
+  moods?: string[];
+  context_type?: MemoryContext;
+  shopping_status?: ShoppingStatus;
+  nearby?: boolean;
+};
+
+type ChatResponse = { status: string; answer: string; memories: Memory[]; filters?: MemoryFilters };
 type Requester = (path: string, options?: RequestInit) => Promise<any>;
 
 type ChatMessage = {
@@ -67,6 +76,7 @@ type ChatMessage = {
   tags?: string[];
   moods?: string[];
   memories?: Memory[];
+  filters?: MemoryFilters;
   meta?: string;
   error?: boolean;
 };
@@ -284,6 +294,15 @@ function contextLabel(value: MemoryContext | undefined) {
 
 function shoppingLabel(value: ShoppingStatus | null | undefined) {
   return SHOPPING_OPTIONS.find((option) => option.value === value)?.label || null;
+}
+
+function isNearbyQuery(value: string) {
+  return /\b(?:nearby|closest)\b|\bnear\s+me\b/i.test(value);
+}
+
+function formatDistance(distanceKm: number) {
+  if (distanceKm < 1) return `${Math.max(1, Math.round(distanceKm * 1000))} m away`;
+  return `${distanceKm < 10 ? distanceKm.toFixed(1) : Math.round(distanceKm)} km away`;
 }
 
 function normalizeMood(value: string) {
@@ -633,8 +652,12 @@ function ChatScreen({
 
   function selectTag(tag: string) {
     const active = activeHashtag(draft);
-    if (active) setDraft(draft.slice(0, active.start).trimEnd());
-    addTags([tag]);
+    if (active && !pendingPhoto) {
+      setDraft(`${draft.slice(0, active.start)}#${tag} `);
+    } else {
+      if (active) setDraft(draft.slice(0, active.start).trimEnd());
+      addTags([tag]);
+    }
     requestAnimationFrame(() => inputRef.current?.focus());
   }
 
@@ -799,16 +822,28 @@ function ChatScreen({
         });
         await onMemorySaved();
       } else {
+        let coordinates: Coordinates | null = null;
+        if (isNearbyQuery(text)) {
+          updateMessage(userId, { meta: 'Finding what is closest…' });
+          coordinates = await getAutomaticLocation();
+          updateMessage(userId, { meta: coordinates ? 'Used your current location' : 'Location was not available' });
+        }
         const response = (await request('/chat', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ message: text, top_k: 3 }),
+          body: JSON.stringify({
+            message: text,
+            top_k: 5,
+            lat: coordinates?.lat,
+            lon: coordinates?.lon,
+          }),
         })) as ChatResponse;
         addMessage({
           id: messageId('bepo'),
           role: 'assistant',
           text: response.answer,
           memories: response.memories || [],
+          filters: response.filters,
         });
       }
     } catch (error) {
@@ -825,13 +860,15 @@ function ChatScreen({
   }
 
   const canSend = Boolean(draft.trim() || pendingPhoto) && !sending && !pendingPhoto?.metadataLoading;
-  const activeTag = pendingPhoto ? activeHashtag(draft) : null;
+  const activeTag = activeHashtag(draft);
   const matchingTags = activeTag
     ? knownTags
-      .filter((tag) => !selectedTags.includes(tag) && (!activeTag.query || tag.startsWith(activeTag.query)))
+      .filter((tag) => (!pendingPhoto || !selectedTags.includes(tag)) && (!activeTag.query || tag.startsWith(activeTag.query)))
       .slice(0, 6)
     : [];
   const canCreateTag = Boolean(
+    pendingPhoto
+    &&
     activeTag?.query
     && !selectedTags.includes(activeTag.query)
     && !knownTags.includes(activeTag.query),
@@ -1012,7 +1049,7 @@ function ChatScreen({
               ))}
             </ScrollView>
           ) : null}
-          {pendingPhoto && activeTag ? (
+          {activeTag ? (
             <View style={styles.tagSuggestions}>
               {matchingTags.length || canCreateTag ? (
                 <ScrollView
@@ -1043,7 +1080,7 @@ function ChatScreen({
                   ) : null}
                 </ScrollView>
               ) : (
-                <Text style={styles.tagSuggestionHint}>Keep typing to make a new tag</Text>
+                <Text style={styles.tagSuggestionHint}>{pendingPhoto ? 'Keep typing to make a new tag' : 'No saved tag matches yet'}</Text>
               )}
             </View>
           ) : null}
@@ -1101,7 +1138,7 @@ function ChatControls({ memoryCount, onOpenMemories, onOpenSettings }: {
 }
 
 function EmptyConversation({ onPrompt }: { onPrompt: (prompt: string) => void }) {
-  const prompts = ['What do you remember most recently?', 'Where was one of my saved moments?'];
+  const prompts = ['#cafe calm nearby', '#shopping want', 'What do you remember most recently?'];
   return (
     <View style={styles.emptyConversation}>
       <BrandMark size={82} />
@@ -1148,6 +1185,15 @@ function ChatBubble({ message, apiUrl, apiKey }: { message: ChatMessage; apiUrl:
       <BrandMark size={30} />
       <View style={styles.assistantContent}>
         <Text style={[styles.assistantText, message.error && styles.assistantError]}>{message.text}</Text>
+        {message.filters && Object.keys(message.filters).length ? (
+          <View style={styles.assistantFilterRow}>
+            {message.filters.tags?.map((tag) => <Text key={`tag-${tag}`} style={styles.assistantTagFilter}>#{tag}</Text>)}
+            {message.filters.moods?.map((mood) => <Text key={`mood-${mood}`} style={styles.assistantMoodFilter}>{mood}</Text>)}
+            {message.filters.context_type ? <Text style={styles.assistantNeutralFilter}>{contextLabel(message.filters.context_type)}</Text> : null}
+            {message.filters.shopping_status ? <Text style={styles.assistantStatusFilter}>{shoppingLabel(message.filters.shopping_status)}</Text> : null}
+            {message.filters.nearby ? <Text style={styles.assistantNearbyFilter}>⌖ nearby</Text> : null}
+          </View>
+        ) : null}
         {message.memories?.map((memory) => (
           <MemoryCard key={memory.id} memory={memory} apiUrl={apiUrl} apiKey={apiKey} compact />
         ))}
@@ -1253,10 +1299,13 @@ function MemoryCard({ memory, apiUrl, apiKey, compact = false, onPress }: {
         <View style={styles.memoryDetailsRow}>
           <Text style={styles.memoryContext}>{memory.context_type === 'online' ? '◎ Online' : memory.context_type === 'mixed' ? '⌖ + ◎ Both' : memory.context_type === 'physical' ? '⌖ A place' : '○ Not sorted yet'}</Text>
           {status ? <Text style={styles.memoryStatus}>{status}</Text> : null}
+          {memory.distance_km !== null && memory.distance_km !== undefined ? (
+            <Text style={styles.memoryDistance}>⌖ {formatDistance(memory.distance_km)}</Text>
+          ) : null}
         </View>
         {memory.place_hint ? <Text style={styles.memoryPlace}>⌖ {memory.place_hint}</Text> : null}
         <Text style={styles.memoryHistory}>{memoryHistoryText(memory)}</Text>
-        {memory.map_url ? (
+        {memory.map_url && memory.context_type !== 'online' ? (
           <Pressable onPress={() => Linking.openURL(memory.map_url!)}>
             <Text style={styles.mapLink}>View where this was taken ↗</Text>
           </Pressable>

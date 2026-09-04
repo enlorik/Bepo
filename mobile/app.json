@@ -21,7 +21,7 @@
       "infoPlist": {
         "NSCameraUsageDescription": "Bepo uses the camera when you choose to capture a new memory.",
         "NSPhotoLibraryUsageDescription": "Bepo reads the original date and location of photos you choose for your memories.",
-        "NSLocationWhenInUseUsageDescription": "Bepo can attach your current location to a memory when you ask it to."
+        "NSLocationWhenInUseUsageDescription": "Bepo uses your location to save places and sort nearby memories when you ask."
       }
     },
     "android": {
@@ -51,7 +51,7 @@
       [
         "expo-location",
         {
-          "locationWhenInUsePermission": "Bepo can attach your current location to a memory when you ask it to."
+          "locationWhenInUsePermission": "Bepo uses your location to save places and sort nearby memories when you ask."
         }
       ],
       [

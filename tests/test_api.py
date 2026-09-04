@@ -631,6 +631,97 @@ class TestSearch:
         r2 = client.post("/search", data={"query": "test", "top_k": "21"})
         assert r2.status_code == 422
 
+    def test_hashtag_filter_is_exact(self, client):
+        cafe_id = client.post(
+            "/memory",
+            files={"photo": ("cafe.jpg", _tiny_jpeg(), "image/jpeg")},
+            data={"note": "window table", "tags": "cafe"},
+        ).json()["memory_id"]
+        client.post(
+            "/memory",
+            files={"photo": ("other.jpg", _tiny_jpeg(), "image/jpeg")},
+            data={"note": "office machine", "tags": "cafeteria"},
+        )
+
+        data = client.post("/search", data={"query": "#cafe"}).json()
+
+        assert data["status"] == "success"
+        assert data["filters"] == {"tags": ["cafe"]}
+        assert [memory["id"] for memory in data["matches"]] == [cafe_id]
+
+    def test_structured_filters_are_combined(self, client):
+        matching_id = client.post(
+            "/memory",
+            files={"photo": ("match.jpg", _tiny_jpeg(), "image/jpeg")},
+            data={
+                "note": "green cardigan",
+                "tags": "shopping",
+                "mood": "calm,hopeful",
+                "context_type": "online",
+                "shopping_status": "bought",
+            },
+        ).json()["memory_id"]
+        client.post(
+            "/memory",
+            files={"photo": ("wrong.jpg", _tiny_jpeg(), "image/jpeg")},
+            data={
+                "note": "blue cardigan",
+                "tags": "shopping",
+                "mood": "excited",
+                "context_type": "online",
+                "shopping_status": "want",
+            },
+        )
+
+        data = client.post("/search", data={"query": "#shopping calm bought online"}).json()
+
+        assert data["status"] == "success"
+        assert [memory["id"] for memory in data["matches"]] == [matching_id]
+        assert data["filters"] == {
+            "tags": ["shopping"],
+            "moods": ["calm"],
+            "context_type": "online",
+            "shopping_status": "bought",
+        }
+
+    def test_nearby_requires_current_location(self, client):
+        client.post(
+            "/memory",
+            files={"photo": ("cafe.jpg", _tiny_jpeg(), "image/jpeg")},
+            data={"tags": "cafe", "lat": "52.23", "lon": "21.01"},
+        )
+
+        data = client.post("/search", data={"query": "#cafe nearby"}).json()
+
+        assert data["status"] == "needs_location"
+        assert data["filters"] == {"tags": ["cafe"], "nearby": True}
+
+    def test_nearby_excludes_online_and_sorts_closest_first(self, client):
+        far_id = client.post(
+            "/memory",
+            files={"photo": ("far.jpg", _tiny_jpeg(), "image/jpeg")},
+            data={"tags": "cafe", "lat": "52.30", "lon": "21.01"},
+        ).json()["memory_id"]
+        near_id = client.post(
+            "/memory",
+            files={"photo": ("near.jpg", _tiny_jpeg(), "image/jpeg")},
+            data={"tags": "cafe", "lat": "52.231", "lon": "21.011"},
+        ).json()["memory_id"]
+        client.post(
+            "/memory",
+            files={"photo": ("online.jpg", _tiny_jpeg(), "image/jpeg")},
+            data={"tags": "cafe", "context_type": "online", "lat": "52.2301", "lon": "21.0101"},
+        )
+
+        data = client.post(
+            "/search",
+            data={"query": "#cafe nearby", "lat": "52.23", "lon": "21.01"},
+        ).json()
+
+        assert [memory["id"] for memory in data["matches"]] == [near_id, far_id]
+        assert data["matches"][0]["distance_km"] < data["matches"][1]["distance_km"]
+        assert all(memory["context_type"] != "online" for memory in data["matches"])
+
 
 class TestChat:
     def test_no_results_on_empty_database(self, client):
@@ -729,6 +820,41 @@ class TestChat:
         assert data["status"] == "success"
         assert data["count"] >= 1
         assert data["matches"][0]["note"] == "ocean at dusk"
+
+    def test_conversational_nearby_query_uses_coordinates(self, client):
+        memory_id = client.post(
+            "/memory",
+            files={"photo": ("img.jpg", _tiny_jpeg(), "image/jpeg")},
+            data={"note": "quiet corner", "tags": "cafe", "mood": "calm", "lat": "50.061", "lon": "19.938"},
+        ).json()["memory_id"]
+
+        data = client.post(
+            "/chat",
+            json={"message": "#cafe calm nearby", "lat": 50.06, "lon": 19.94},
+        ).json()
+
+        assert data["status"] == "success"
+        assert data["memories"][0]["id"] == memory_id
+        assert data["memories"][0]["distance_km"] is not None
+        assert data["filters"] == {"tags": ["cafe"], "moods": ["calm"], "nearby": True}
+        assert "closest first" in data["answer"]
+
+    def test_shopping_want_phrase_is_a_status_not_a_tag(self, client):
+        wanted_id = client.post(
+            "/memory",
+            files={"photo": ("want.jpg", _tiny_jpeg(), "image/jpeg")},
+            data={"tags": "shopping", "shopping_status": "want"},
+        ).json()["memory_id"]
+        client.post(
+            "/memory",
+            files={"photo": ("bought.jpg", _tiny_jpeg(), "image/jpeg")},
+            data={"tags": "shopping", "shopping_status": "bought"},
+        )
+
+        data = client.post("/chat", json={"message": "#shopping want"}).json()
+
+        assert [memory["id"] for memory in data["memories"]] == [wanted_id]
+        assert data["filters"] == {"tags": ["shopping"], "shopping_status": "want"}
 
 
 class TestBuildMapUrl:
