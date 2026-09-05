@@ -1,3 +1,4 @@
 -r requirements.txt
-torch
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.8.0+cpu
 transformers>=4.30.0,<5.0.0
