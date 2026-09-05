@@ -88,6 +88,7 @@ METADATA_FIELDS = (
     "place_hint",
     "context_type",
     "shopping_status",
+    "place_id",
 )
 
 CONTEXT_TYPES = {"physical", "online", "mixed", "unknown"}
@@ -103,6 +104,7 @@ class MemoryMetadataUpdate(BaseModel):
     place_hint: Optional[str] = None
     context_type: Optional[str] = None
     shopping_status: Optional[str] = None
+    place_id: Optional[int] = Field(default=None, ge=1)
 
     @field_validator("context_type")
     @classmethod
@@ -124,6 +126,37 @@ class MemoryMetadataUpdate(BaseModel):
             raise ValueError("shopping_status must be want, ordered, bought, returned, or no_longer_want")
         return cleaned
 
+
+class PlaceCreate(BaseModel):
+    name: str
+    parent_id: Optional[int] = Field(default=None, ge=1)
+    lat: Optional[float] = Field(default=None, ge=-90, le=90)
+    lon: Optional[float] = Field(default=None, ge=-180, le=180)
+
+    @field_validator("name")
+    @classmethod
+    def name_not_blank(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("name must not be blank")
+        return cleaned
+
+
+class PlaceUpdate(BaseModel):
+    name: Optional[str] = None
+    parent_id: Optional[int] = Field(default=None, ge=1)
+    lat: Optional[float] = Field(default=None, ge=-90, le=90)
+    lon: Optional[float] = Field(default=None, ge=-180, le=180)
+
+    @field_validator("name")
+    @classmethod
+    def optional_name_not_blank(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return value
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("name must not be blank")
+        return cleaned
 
 class ChatRequest(BaseModel):
     message: str
@@ -162,8 +195,22 @@ def init_db():
     os.makedirs(os.path.dirname(os.path.abspath(DB_PATH)), exist_ok=True)
     
     conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA foreign_keys = ON")
     cursor = conn.cursor()
-    
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS places (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            parent_id INTEGER,
+            lat REAL,
+            lon REAL,
+            created_at DATETIME NOT NULL,
+            updated_at DATETIME NOT NULL,
+            FOREIGN KEY(parent_id) REFERENCES places(id) ON DELETE RESTRICT
+        )
+    """)
+
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS memories (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -181,7 +228,9 @@ def init_db():
             note_updated_at DATETIME,
             context_type TEXT NOT NULL DEFAULT 'unknown',
             shopping_status TEXT,
-            shopping_status_updated_at DATETIME
+            shopping_status_updated_at DATETIME,
+            place_id INTEGER,
+            FOREIGN KEY(place_id) REFERENCES places(id) ON DELETE SET NULL
         )
     """)
 
@@ -202,6 +251,7 @@ def init_db():
         "context_type": "ALTER TABLE memories ADD COLUMN context_type TEXT NOT NULL DEFAULT 'unknown'",
         "shopping_status": "ALTER TABLE memories ADD COLUMN shopping_status TEXT",
         "shopping_status_updated_at": "ALTER TABLE memories ADD COLUMN shopping_status_updated_at DATETIME",
+        "place_id": "ALTER TABLE memories ADD COLUMN place_id INTEGER REFERENCES places(id) ON DELETE SET NULL",
     }
     for column, statement in migration_alter_statements.items():
         if column not in existing_columns:
@@ -216,6 +266,9 @@ def init_db():
             WHERE lat IS NOT NULL AND lon IS NOT NULL
         """)
     cursor.execute("UPDATE memories SET context_type = 'unknown' WHERE context_type IS NULL")
+
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_places_parent_id ON places(parent_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_memories_place_id ON memories(place_id)")
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS memory_status_history (
@@ -374,8 +427,133 @@ def get_text_embedding(text: str) -> np.ndarray:
 def get_db_connection() -> sqlite3.Connection:
     """Open a SQLite connection with row_factory set to Row."""
     conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA foreign_keys = ON")
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def fetch_place_by_id(place_id: int, conn: Optional[sqlite3.Connection] = None) -> Optional[sqlite3.Row]:
+    """Return a place row, optionally reusing an existing connection."""
+    owns_connection = conn is None
+    active_conn = conn or get_db_connection()
+    try:
+        return active_conn.execute(
+            "SELECT id, name, parent_id, lat, lon, created_at, updated_at FROM places WHERE id = ?",
+            (place_id,),
+        ).fetchone()
+    finally:
+        if owns_connection:
+            active_conn.close()
+
+
+def place_path_rows(conn: sqlite3.Connection, place_id: int) -> list[sqlite3.Row]:
+    """Return a place's root-to-leaf path while defending against corrupt cycles."""
+    path = []
+    seen = set()
+    current_id: Optional[int] = place_id
+    while current_id is not None and current_id not in seen:
+        seen.add(current_id)
+        row = fetch_place_by_id(current_id, conn)
+        if row is None:
+            break
+        path.append(row)
+        current_id = row["parent_id"]
+    path.reverse()
+    return path
+
+
+def place_descendant_ids(conn: sqlite3.Connection, place_id: int) -> list[int]:
+    """Return a place id and every nested child id."""
+    rows = conn.execute(
+        """
+        WITH RECURSIVE descendants(id) AS (
+            SELECT id FROM places WHERE id = ?
+            UNION ALL
+            SELECT places.id FROM places JOIN descendants ON places.parent_id = descendants.id
+        )
+        SELECT id FROM descendants
+        """,
+        (place_id,),
+    ).fetchall()
+    return [row["id"] for row in rows]
+
+
+def place_to_response(conn: sqlite3.Connection, row: sqlite3.Row) -> dict:
+    """Build a place response with hierarchy and inherited pin information."""
+    path_rows = place_path_rows(conn, row["id"])
+    effective_row = next(
+        (item for item in reversed(path_rows) if item["lat"] is not None and item["lon"] is not None),
+        None,
+    )
+    descendant_ids = place_descendant_ids(conn, row["id"])
+    placeholders = ",".join("?" for _ in descendant_ids)
+    descendant_memory_count = conn.execute(
+        f"SELECT COUNT(*) FROM memories WHERE place_id IN ({placeholders})",
+        descendant_ids,
+    ).fetchone()[0]
+    direct_memory_count = conn.execute(
+        "SELECT COUNT(*) FROM memories WHERE place_id = ?", (row["id"],)
+    ).fetchone()[0]
+    child_count = conn.execute(
+        "SELECT COUNT(*) FROM places WHERE parent_id = ?", (row["id"],)
+    ).fetchone()[0]
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "parent_id": row["parent_id"],
+        "lat": row["lat"],
+        "lon": row["lon"],
+        "effective_lat": effective_row["lat"] if effective_row else None,
+        "effective_lon": effective_row["lon"] if effective_row else None,
+        "pin_inherited": effective_row is not None and effective_row["id"] != row["id"],
+        "path": [{"id": item["id"], "name": item["name"]} for item in path_rows],
+        "path_label": " › ".join(item["name"] for item in path_rows),
+        "direct_memory_count": direct_memory_count,
+        "memory_count": descendant_memory_count,
+        "child_count": child_count,
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def validate_place_parent(
+    conn: sqlite3.Connection,
+    parent_id: Optional[int],
+    place_id: Optional[int] = None,
+) -> None:
+    """Require an existing parent and prevent a place hierarchy cycle."""
+    if parent_id is None:
+        return
+    if fetch_place_by_id(parent_id, conn) is None:
+        raise HTTPException(status_code=422, detail=f"Parent place {parent_id} not found")
+    current_id: Optional[int] = parent_id
+    seen = set()
+    while current_id is not None and current_id not in seen:
+        if place_id is not None and current_id == place_id:
+            raise HTTPException(status_code=422, detail="A place cannot be inside itself or one of its children")
+        seen.add(current_id)
+        current = fetch_place_by_id(current_id, conn)
+        current_id = current["parent_id"] if current else None
+
+
+def ensure_unique_place_name(
+    conn: sqlite3.Connection,
+    name: str,
+    parent_id: Optional[int],
+    place_id: Optional[int] = None,
+) -> None:
+    """Prevent confusing duplicate place names under the same parent."""
+    duplicate = conn.execute(
+        """
+        SELECT id FROM places
+        WHERE LOWER(name) = LOWER(?)
+          AND ((parent_id IS NULL AND ? IS NULL) OR parent_id = ?)
+          AND (? IS NULL OR id <> ?)
+        """,
+        (name, parent_id, parent_id, place_id, place_id),
+    ).fetchone()
+    if duplicate is not None:
+        raise HTTPException(status_code=409, detail="A place with that name already exists here")
 
 
 def build_map_url(lat, lon) -> Optional[str]:
@@ -412,6 +590,7 @@ def row_to_memory_response(row: sqlite3.Row) -> dict:
         "context_type": row["context_type"],
         "shopping_status": row["shopping_status"],
         "shopping_status_updated_at": row["shopping_status_updated_at"],
+        "place_id": row["place_id"],
         "lat": lat,
         "lon": lon,
         "location_source": row["location_source"],
@@ -444,7 +623,7 @@ def fetch_memory_by_id(memory_id: int) -> Optional[sqlite3.Row]:
             "SELECT id, ts, taken_at, taken_at_source, lat, lon, location_source, "
             "image_path, image_emb, text_note, text_emb, note_created_at, note_updated_at, "
             "user_note, bepo_summary, tags, mood, place_hint, context_type, shopping_status, "
-            "shopping_status_updated_at "
+            "shopping_status_updated_at, place_id "
             "FROM memories WHERE id = ?",
             (memory_id,),
         )
@@ -645,7 +824,7 @@ def search_memory_matches_with_filters(
             "SELECT id, ts, taken_at, taken_at_source, lat, lon, location_source, "
             "image_path, image_emb, text_note, text_emb, note_created_at, note_updated_at, "
             "user_note, bepo_summary, tags, mood, place_hint, context_type, shopping_status, "
-            "shopping_status_updated_at "
+            "shopping_status_updated_at, place_id "
             "FROM memories"
         )
         rows = cursor.fetchall()
@@ -731,6 +910,7 @@ def search_memory_matches_with_filters(
             "context_type": row["context_type"],
             "shopping_status": row["shopping_status"],
             "shopping_status_updated_at": row["shopping_status_updated_at"],
+            "place_id": row["place_id"],
             "lat": lat,
             "lon": lon,
             "location_source": row["location_source"],
@@ -810,6 +990,7 @@ async def create_memory(
     place_hint: Optional[str] = Form(None),
     context_type: Optional[str] = Form(None),
     shopping_status: Optional[str] = Form(None),
+    place_id: Optional[int] = Form(None),
     taken_at: Optional[str] = Form(None),
     taken_at_source: Optional[str] = Form(None),
     lat: Optional[float] = Form(None),
@@ -846,6 +1027,8 @@ async def create_memory(
         resolved_context = normalized_context or (
             "physical" if lat is not None and lon is not None else "unknown"
         )
+        if place_id is not None and fetch_place_by_id(place_id) is None:
+            raise HTTPException(status_code=422, detail=f"Place {place_id} not found")
 
         # The server timestamp records when the memory/note was added. The
         # optional photo timestamp records when the event itself happened.
@@ -877,9 +1060,9 @@ async def create_memory(
                     ts, taken_at, taken_at_source, lat, lon, location_source,
                     image_path, image_emb, text_note, text_emb, note_created_at, note_updated_at,
                     user_note, bepo_summary, tags, mood, place_hint, context_type,
-                    shopping_status, shopping_status_updated_at
+                    shopping_status, shopping_status_updated_at, place_id
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 timestamp_iso,
                 parsed_taken_at,
@@ -901,6 +1084,7 @@ async def create_memory(
                 resolved_context,
                 normalized_status,
                 timestamp_iso if normalized_status is not None else None,
+                place_id,
             ))
             memory_id = cursor.lastrowid
             if normalized_status is not None:
@@ -932,6 +1116,7 @@ async def create_memory(
             "context_type": resolved_context,
             "shopping_status": normalized_status,
             "shopping_status_updated_at": timestamp_iso if normalized_status is not None else None,
+            "place_id": place_id,
             "lat": lat,
             "lon": lon,
             "location_source": location_source if lat is not None and lon is not None else None,
@@ -952,6 +1137,9 @@ async def update_memory_metadata(memory_id: int, payload: MemoryMetadataUpdate):
         raise HTTPException(status_code=404, detail=f"Memory {memory_id} not found")
 
     updates = metadata_payload_to_updates(payload)
+    if "place_id" in updates and updates["place_id"] is not None:
+        if fetch_place_by_id(updates["place_id"]) is None:
+            raise HTTPException(status_code=422, detail=f"Place {updates['place_id']} not found")
     merged_values = {
         "text_note": existing_row["text_note"],
         "user_note": existing_row["user_note"],
@@ -961,6 +1149,7 @@ async def update_memory_metadata(memory_id: int, payload: MemoryMetadataUpdate):
         "place_hint": existing_row["place_hint"],
         "context_type": existing_row["context_type"],
         "shopping_status": existing_row["shopping_status"],
+        "place_id": existing_row["place_id"],
     }
     merged_values.update(updates)
     if merged_values["context_type"] is None:
@@ -1004,7 +1193,7 @@ async def update_memory_metadata(memory_id: int, payload: MemoryMetadataUpdate):
             UPDATE memories
             SET text_note = ?, user_note = ?, bepo_summary = ?, tags = ?, mood = ?, place_hint = ?,
                 context_type = ?, shopping_status = ?, shopping_status_updated_at = ?,
-                text_emb = ?, note_created_at = ?, note_updated_at = ?
+                place_id = ?, text_emb = ?, note_created_at = ?, note_updated_at = ?
             WHERE id = ?
             """,
             (
@@ -1017,6 +1206,7 @@ async def update_memory_metadata(memory_id: int, payload: MemoryMetadataUpdate):
                 merged_values["context_type"],
                 merged_values["shopping_status"],
                 shopping_status_updated_at,
+                merged_values["place_id"],
                 serialized_text_emb,
                 note_created_at,
                 note_updated_at,
@@ -1032,7 +1222,7 @@ async def update_memory_metadata(memory_id: int, payload: MemoryMetadataUpdate):
         cursor.execute(
             "SELECT id, ts, taken_at, taken_at_source, lat, lon, location_source, image_path, "
             "text_note, note_created_at, note_updated_at, user_note, bepo_summary, tags, mood, place_hint, "
-            "context_type, shopping_status, shopping_status_updated_at "
+            "context_type, shopping_status, shopping_status_updated_at, place_id "
             "FROM memories WHERE id = ?",
             (memory_id,),
         )
@@ -1041,6 +1231,160 @@ async def update_memory_metadata(memory_id: int, payload: MemoryMetadataUpdate):
         conn.close()
 
     return row_to_memory_response(updated_row)
+
+
+@router.get("/places")
+async def list_places():
+    """Return every manually defined place with hierarchy and counts."""
+    conn = get_db_connection()
+    try:
+        rows = conn.execute(
+            "SELECT id, name, parent_id, lat, lon, created_at, updated_at FROM places"
+        ).fetchall()
+        places = [place_to_response(conn, row) for row in rows]
+        places.sort(key=lambda place: place["path_label"].casefold())
+        return places
+    finally:
+        conn.close()
+
+
+@router.get("/places/suggestions")
+async def suggest_places(
+    lat: float,
+    lon: float,
+    radius_m: float = 250,
+    limit: int = 8,
+):
+    """Suggest existing nearby place pins without assigning anything."""
+    if not (-90 <= lat <= 90) or not (-180 <= lon <= 180):
+        raise HTTPException(status_code=422, detail="Invalid latitude or longitude")
+    if not (1 <= radius_m <= 50000):
+        raise HTTPException(status_code=422, detail="radius_m must be between 1 and 50000")
+    if not (1 <= limit <= 25):
+        raise HTTPException(status_code=422, detail="limit must be between 1 and 25")
+
+    conn = get_db_connection()
+    try:
+        rows = conn.execute(
+            "SELECT id, name, parent_id, lat, lon, created_at, updated_at FROM places"
+        ).fetchall()
+        suggestions = []
+        for row in rows:
+            place = place_to_response(conn, row)
+            # Only independently pinned places are suggestions. Children that
+            # inherit the same pin stay available inside their parent without
+            # flooding the nearby list with duplicate coordinates.
+            if place["lat"] is None or place["lon"] is None:
+                continue
+            distance_km = haversine_distance_km(
+                lat, lon, place["lat"], place["lon"]
+            )
+            if distance_km * 1000 <= radius_m:
+                suggestions.append({**place, "distance_m": round(distance_km * 1000)})
+        suggestions.sort(key=lambda place: (place["distance_m"], place["path_label"].casefold()))
+        return suggestions[:limit]
+    finally:
+        conn.close()
+
+
+@router.post("/places")
+async def create_place(payload: PlaceCreate):
+    """Create a manual root place or a place nested inside another place."""
+    if (payload.lat is None) != (payload.lon is None):
+        raise HTTPException(status_code=422, detail="lat and lon must be provided together")
+    timestamp = datetime.now().astimezone().isoformat()
+    conn = get_db_connection()
+    try:
+        validate_place_parent(conn, payload.parent_id)
+        ensure_unique_place_name(conn, payload.name, payload.parent_id)
+        cursor = conn.execute(
+            """
+            INSERT INTO places (name, parent_id, lat, lon, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (payload.name, payload.parent_id, payload.lat, payload.lon, timestamp, timestamp),
+        )
+        place_id = cursor.lastrowid
+        conn.commit()
+        row = fetch_place_by_id(place_id, conn)
+        return place_to_response(conn, row)
+    finally:
+        conn.close()
+
+
+@router.patch("/places/{place_id}")
+async def update_place(place_id: int, payload: PlaceUpdate):
+    """Rename, move, or update the optional pin for an existing place."""
+    conn = get_db_connection()
+    try:
+        existing = fetch_place_by_id(place_id, conn)
+        if existing is None:
+            raise HTTPException(status_code=404, detail=f"Place {place_id} not found")
+        dump_method = getattr(payload, "model_dump", None)
+        updates = (payload.dict(exclude_unset=True) if dump_method is None
+                   else dump_method(exclude_unset=True))
+        if "name" in updates and updates["name"] is None:
+            raise HTTPException(status_code=422, detail="name cannot be null")
+        if ("lat" in updates) != ("lon" in updates):
+            raise HTTPException(status_code=422, detail="lat and lon must be updated together")
+
+        name = updates.get("name", existing["name"])
+        parent_id = updates.get("parent_id", existing["parent_id"])
+        lat = updates.get("lat", existing["lat"])
+        lon = updates.get("lon", existing["lon"])
+        if (lat is None) != (lon is None):
+            raise HTTPException(status_code=422, detail="lat and lon must be provided together")
+        validate_place_parent(conn, parent_id, place_id)
+        ensure_unique_place_name(conn, name, parent_id, place_id)
+        conn.execute(
+            """
+            UPDATE places
+            SET name = ?, parent_id = ?, lat = ?, lon = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (name, parent_id, lat, lon, datetime.now().astimezone().isoformat(), place_id),
+        )
+        conn.commit()
+        return place_to_response(conn, fetch_place_by_id(place_id, conn))
+    finally:
+        conn.close()
+
+
+@router.get("/places/{place_id}")
+async def get_place(place_id: int):
+    """Return one place, its children, and memories from its whole subtree."""
+    conn = get_db_connection()
+    try:
+        row = fetch_place_by_id(place_id, conn)
+        if row is None:
+            raise HTTPException(status_code=404, detail=f"Place {place_id} not found")
+        place = place_to_response(conn, row)
+        child_rows = conn.execute(
+            "SELECT id, name, parent_id, lat, lon, created_at, updated_at "
+            "FROM places WHERE parent_id = ? ORDER BY LOWER(name)",
+            (place_id,),
+        ).fetchall()
+        descendant_ids = place_descendant_ids(conn, place_id)
+        placeholders = ",".join("?" for _ in descendant_ids)
+        memory_rows = conn.execute(
+            f"""
+            SELECT id, ts, taken_at, taken_at_source, lat, lon, location_source, image_path,
+                   text_note, note_created_at, note_updated_at, user_note, bepo_summary,
+                   tags, mood, place_hint, context_type, shopping_status,
+                   shopping_status_updated_at, place_id
+            FROM memories
+            WHERE place_id IN ({placeholders})
+            ORDER BY COALESCE(taken_at, ts) DESC
+            """,
+            descendant_ids,
+        ).fetchall()
+        return {
+            **place,
+            "children": [place_to_response(conn, child) for child in child_rows],
+            "memories": [row_to_memory_response(memory) for memory in memory_rows],
+        }
+    finally:
+        conn.close()
 
 @router.post("/search")
 async def search_memories(
@@ -1152,7 +1496,7 @@ async def list_memories():
         cursor.execute(
             "SELECT id, ts, taken_at, taken_at_source, lat, lon, location_source, image_path, "
             "text_note, note_created_at, note_updated_at, user_note, bepo_summary, tags, mood, place_hint, "
-            "context_type, shopping_status, shopping_status_updated_at "
+            "context_type, shopping_status, shopping_status_updated_at, place_id "
             "FROM memories ORDER BY COALESCE(taken_at, ts) DESC"
         )
         rows = cursor.fetchall()
@@ -1205,7 +1549,7 @@ async def root():
     """Root endpoint with API information"""
     return {
         "app": "Bepo",
-        "version": "0.8",
+        "version": "0.9",
         "description": "Memory storage and search with image and text embeddings",
         "endpoints": {
             "POST /memory": "Store a new memory with photo, note, and GPS",
@@ -1213,6 +1557,11 @@ async def root():
             "GET /memories": "List all memories, newest first",
             "GET /memory/{id}": "Get a single memory by id",
             "GET /memory/{id}/status-history": "Show shopping-status changes for a memory",
+            "GET /places": "List the manual place forest",
+            "POST /places": "Create a root place or nested subplace",
+            "PATCH /places/{id}": "Rename, move, or pin a place",
+            "GET /places/{id}": "Open one place branch and its memories",
+            "GET /places/suggestions": "Suggest existing nearby pins without auto-assigning",
             "GET /image/{id}": "Serve the image for a memory",
             "POST /search": "Search with exact tags, moods, context, shopping stage, and nearby distance",
             "POST /chat": "Ask naturally with structured filters and optional current location",
@@ -1234,4 +1583,3 @@ if __name__ == "__main__":
         host=os.getenv("HOST", "0.0.0.0"),
         port=int(os.getenv("PORT", "8000")),
     )
-

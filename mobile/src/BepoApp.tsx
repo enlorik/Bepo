@@ -27,7 +27,7 @@ const DEFAULT_API_URL = 'https://bepo-production.up.railway.app';
 const KEY_STORAGE_NAME = 'bepo_api_key';
 const URL_STORAGE_NAME = 'bepo_api_url';
 
-type Screen = 'chat' | 'memories' | 'memory' | 'settings';
+type Screen = 'chat' | 'memories' | 'memory' | 'places' | 'settings';
 type MemoryContext = 'physical' | 'online' | 'mixed' | 'unknown';
 type ShoppingStatus = 'want' | 'ordered' | 'bought' | 'returned' | 'no_longer_want';
 
@@ -48,6 +48,7 @@ type Memory = {
   context_type?: MemoryContext;
   shopping_status?: ShoppingStatus | null;
   shopping_status_updated_at?: string | null;
+  place_id?: number | null;
   lat: number | null;
   lon: number | null;
   location_source?: 'photo' | 'current' | 'manual' | null;
@@ -56,6 +57,27 @@ type Memory = {
   distance_km?: number | null;
   score?: number;
 };
+
+type PlacePathItem = { id: number; name: string };
+
+type Place = {
+  id: number;
+  name: string;
+  parent_id: number | null;
+  lat: number | null;
+  lon: number | null;
+  effective_lat: number | null;
+  effective_lon: number | null;
+  pin_inherited: boolean;
+  path: PlacePathItem[];
+  path_label: string;
+  direct_memory_count: number;
+  memory_count: number;
+  child_count: number;
+  distance_m?: number;
+};
+
+type PlaceDetail = Place & { children: Place[]; memories: Memory[] };
 
 type MemoryFilters = {
   tags?: string[];
@@ -305,6 +327,10 @@ function formatDistance(distanceKm: number) {
   return `${distanceKm < 10 ? distanceKm.toFixed(1) : Math.round(distanceKm)} km away`;
 }
 
+function placeForMemory(memory: Memory, places: Place[]) {
+  return places.find((place) => place.id === memory.place_id) || null;
+}
+
 function normalizeMood(value: string) {
   return value
     .trim()
@@ -373,6 +399,8 @@ function finalizeTaggedNote(value: string, selectedTags: string[]) {
 export default function BepoApp() {
   const [screen, setScreen] = useState<Screen>('chat');
   const [selectedMemoryId, setSelectedMemoryId] = useState<number | null>(null);
+  const [selectedPlaceId, setSelectedPlaceId] = useState<number | null>(null);
+  const [memoryReturnScreen, setMemoryReturnScreen] = useState<'memories' | 'places'>('memories');
   const [apiUrl, setApiUrl] = useState(DEFAULT_API_URL);
   const [apiKey, setApiKey] = useState('');
   const [draftUrl, setDraftUrl] = useState(DEFAULT_API_URL);
@@ -383,6 +411,8 @@ export default function BepoApp() {
   const [memories, setMemories] = useState<Memory[]>([]);
   const [loadingMemories, setLoadingMemories] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
+  const [places, setPlaces] = useState<Place[]>([]);
+  const [loadingPlaces, setLoadingPlaces] = useState(false);
   const selectedMemory = memories.find((memory) => memory.id === selectedMemoryId) || null;
 
   const request = useCallback(
@@ -433,6 +463,21 @@ export default function BepoApp() {
     [apiKey, request],
   );
 
+  const loadPlaces = useCallback(
+    async (quiet = false) => {
+      if (!apiKey) return;
+      if (!quiet) setLoadingPlaces(true);
+      try {
+        setPlaces((await request('/places')) as Place[]);
+      } catch (error) {
+        if (!quiet) Alert.alert('Could not load places', errorMessage(error));
+      } finally {
+        setLoadingPlaces(false);
+      }
+    },
+    [apiKey, request],
+  );
+
   useEffect(() => {
     (async () => {
       try {
@@ -454,8 +499,11 @@ export default function BepoApp() {
   }, []);
 
   useEffect(() => {
-    if (apiKey && !hydrating) loadMemories(true);
-  }, [apiKey, hydrating, loadMemories]);
+    if (apiKey && !hydrating) {
+      loadMemories(true);
+      loadPlaces(true);
+    }
+  }, [apiKey, hydrating, loadMemories, loadPlaces]);
 
   async function saveConnection() {
     const nextUrl = cleanUrl(draftUrl);
@@ -488,8 +536,9 @@ export default function BepoApp() {
     }
   }
 
-  function openMemory(memoryId: number) {
+  function openMemory(memoryId: number, returnScreen: 'memories' | 'places' = 'memories') {
     setSelectedMemoryId(memoryId);
+    setMemoryReturnScreen(returnScreen);
     setScreen('memory');
   }
 
@@ -497,6 +546,7 @@ export default function BepoApp() {
     setMemories((current) => current.map((memory) => (
       memory.id === updatedMemory.id ? updatedMemory : memory
     )));
+    loadPlaces(true);
   }
 
   if (hydrating) {
@@ -548,6 +598,7 @@ export default function BepoApp() {
           knownMoods={knownMoodsFromMemories(memories)}
           onMemorySaved={() => loadMemories(true)}
           onOpenMemories={() => setScreen('memories')}
+          onOpenPlaces={() => setScreen('places')}
           onOpenSettings={() => setScreen('settings')}
         />
       ) : null}
@@ -574,8 +625,23 @@ export default function BepoApp() {
           request={request}
           knownTags={knownTagsFromMemories(memories)}
           knownMoods={knownMoodsFromMemories(memories)}
-          onBack={() => setScreen('memories')}
+          places={places}
+          onBack={() => setScreen(memoryReturnScreen)}
           onSaved={updateMemory}
+        />
+      ) : null}
+      {screen === 'places' ? (
+        <PlacesScreen
+          places={places}
+          loading={loadingPlaces}
+          selectedPlaceId={selectedPlaceId}
+          setSelectedPlaceId={setSelectedPlaceId}
+          request={request}
+          apiUrl={apiUrl}
+          apiKey={apiKey}
+          onReload={() => loadPlaces(true)}
+          onOpenMemory={(memoryId) => openMemory(memoryId, 'places')}
+          onBack={() => setScreen('chat')}
         />
       ) : null}
       {screen === 'settings' ? (
@@ -603,6 +669,7 @@ function ChatScreen({
   knownMoods,
   onMemorySaved,
   onOpenMemories,
+  onOpenPlaces,
   onOpenSettings,
 }: {
   request: Requester;
@@ -613,6 +680,7 @@ function ChatScreen({
   knownMoods: string[];
   onMemorySaved: () => Promise<void>;
   onOpenMemories: () => void;
+  onOpenPlaces: () => void;
   onOpenSettings: () => void;
 }) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -877,7 +945,12 @@ function ChatScreen({
 
   return (
     <View style={styles.fill}>
-      <ChatControls memoryCount={memoryCount} onOpenMemories={onOpenMemories} onOpenSettings={onOpenSettings} />
+      <ChatControls
+        memoryCount={memoryCount}
+        onOpenMemories={onOpenMemories}
+        onOpenPlaces={onOpenPlaces}
+        onOpenSettings={onOpenSettings}
+      />
       <KeyboardAvoidingView
         style={styles.fill}
         behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
@@ -1117,9 +1190,10 @@ function ChatScreen({
   );
 }
 
-function ChatControls({ memoryCount, onOpenMemories, onOpenSettings }: {
+function ChatControls({ memoryCount, onOpenMemories, onOpenPlaces, onOpenSettings }: {
   memoryCount: number;
   onOpenMemories: () => void;
+  onOpenPlaces: () => void;
   onOpenSettings: () => void;
 }) {
   return (
@@ -1128,6 +1202,9 @@ function ChatControls({ memoryCount, onOpenMemories, onOpenSettings }: {
         <Pressable accessibilityLabel="Open memories" style={styles.headerButton} onPress={onOpenMemories}>
           <Ionicons name="albums-outline" size={22} color="#393936" />
           {memoryCount ? <View style={styles.memoryBadge}><Text style={styles.memoryBadgeText}>{memoryCount > 99 ? '99+' : memoryCount}</Text></View> : null}
+        </Pressable>
+        <Pressable accessibilityLabel="Open places" style={styles.headerButton} onPress={onOpenPlaces}>
+          <Ionicons name="git-branch-outline" size={21} color="#393936" />
         </Pressable>
         <Pressable accessibilityLabel="Open settings" style={styles.headerButton} onPress={onOpenSettings}>
           <Ionicons name="ellipsis-horizontal" size={23} color="#393936" />
@@ -1253,6 +1330,336 @@ function MemoriesScreen({ memories, apiUrl, apiKey, loading, refreshing, onRefre
   );
 }
 
+function PlacesScreen({ places, loading, selectedPlaceId, setSelectedPlaceId, request, apiUrl, apiKey, onReload, onOpenMemory, onBack }: {
+  places: Place[];
+  loading: boolean;
+  selectedPlaceId: number | null;
+  setSelectedPlaceId: (placeId: number | null) => void;
+  request: Requester;
+  apiUrl: string;
+  apiKey: string;
+  onReload: () => Promise<void>;
+  onOpenMemory: (memoryId: number) => void;
+  onBack: () => void;
+}) {
+  const [detail, setDetail] = useState<PlaceDetail | null>(null);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [detailError, setDetailError] = useState('');
+  const [editing, setEditing] = useState<{ place: Place | null; parentId: number | null } | null>(null);
+
+  const loadDetail = useCallback(async (placeId: number) => {
+    setDetailLoading(true);
+    setDetailError('');
+    try {
+      setDetail((await request(`/places/${placeId}`)) as PlaceDetail);
+    } catch (error) {
+      setDetailError(errorMessage(error));
+    } finally {
+      setDetailLoading(false);
+    }
+  }, [request]);
+
+  useEffect(() => {
+    if (selectedPlaceId !== null) loadDetail(selectedPlaceId);
+    else setDetail(null);
+  }, [loadDetail, selectedPlaceId]);
+
+  async function handlePlaceSaved(place: Place) {
+    await onReload();
+    setEditing(null);
+    setSelectedPlaceId(place.id);
+    await loadDetail(place.id);
+  }
+
+  if (editing) {
+    return (
+      <PlaceEditorScreen
+        places={places}
+        place={editing.place}
+        initialParentId={editing.parentId}
+        request={request}
+        onSaved={handlePlaceSaved}
+        onCancel={() => setEditing(null)}
+      />
+    );
+  }
+
+  if (selectedPlaceId !== null) {
+    const current = detail || places.find((place) => place.id === selectedPlaceId) || null;
+    const parentId = current?.parent_id ?? null;
+    return (
+      <View style={styles.fill}>
+        <PageHeader
+          title={current?.name || 'Place'}
+          subtitle={current?.path.slice(0, -1).map((item) => item.name).join(' › ') || 'Your place forest'}
+          onBack={() => setSelectedPlaceId(parentId)}
+        />
+        <ScrollView contentContainerStyle={styles.placeDetailContent} showsVerticalScrollIndicator={false}>
+          {detailLoading && !detail ? <ActivityIndicator color="#262624" style={styles.placeLoader} /> : null}
+          {detailError ? <Text style={styles.editorError}>{detailError}</Text> : null}
+          {current ? (
+            <>
+              <View style={styles.placeHeroCard}>
+                <View style={styles.placeHeroIcon}><Ionicons name="location" size={23} color="#765D45" /></View>
+                <View style={styles.placeHeroCopy}>
+                  <Text style={styles.placeHeroTitle}>{current.path_label}</Text>
+                  <Text style={styles.placeHeroMeta}>
+                    {current.lat !== null
+                      ? 'Has its own map pin'
+                      : current.pin_inherited
+                        ? 'Uses its parent’s map pin'
+                        : 'A folder without a map pin'}
+                  </Text>
+                  <Text style={styles.placeHeroMeta}>{current.memory_count} memories in this branch</Text>
+                </View>
+              </View>
+
+              <View style={styles.placeActionRow}>
+                <Pressable
+                  style={styles.placeActionButton}
+                  onPress={() => setEditing({ place: null, parentId: current.id })}
+                >
+                  <Ionicons name="add" size={18} color="#FFFFFF" />
+                  <Text style={styles.placeActionButtonText}>Add inside</Text>
+                </Pressable>
+                <Pressable
+                  style={styles.placeSecondaryAction}
+                  onPress={() => setEditing({ place: current, parentId: current.parent_id })}
+                >
+                  <Ionicons name="pencil-outline" size={17} color="#555550" />
+                  <Text style={styles.placeSecondaryActionText}>Edit</Text>
+                </Pressable>
+              </View>
+
+              <Text style={styles.placeSectionTitle}>Places inside</Text>
+              {detail?.children.length ? (
+                <View style={styles.placeBranchList}>
+                  {detail.children.map((child) => (
+                    <PlaceBranchRow key={child.id} place={child} onPress={() => setSelectedPlaceId(child.id)} />
+                  ))}
+                </View>
+              ) : (
+                <Text style={styles.placeEmptyText}>Nothing nested here yet. “Add inside” can make a room, floor, café area, or anything else.</Text>
+              )}
+
+              <Text style={styles.placeSectionTitle}>Memories in this branch</Text>
+              {detail?.memories.length ? (
+                <View style={styles.placeMemoryList}>
+                  {detail.memories.map((memory) => (
+                    <MemoryCard
+                      key={memory.id}
+                      memory={memory}
+                      apiUrl={apiUrl}
+                      apiKey={apiKey}
+                      onPress={() => onOpenMemory(memory.id)}
+                    />
+                  ))}
+                </View>
+              ) : (
+                <Text style={styles.placeEmptyText}>No memories here yet. Open a memory, tap Edit memory, then choose this place.</Text>
+              )}
+            </>
+          ) : null}
+        </ScrollView>
+      </View>
+    );
+  }
+
+  const roots = places.filter((place) => place.parent_id === null);
+  return (
+    <View style={styles.fill}>
+      <PageHeader title="Places" subtitle="Your memory forest" onBack={onBack} />
+      <ScrollView contentContainerStyle={styles.placesContent} showsVerticalScrollIndicator={false}>
+        <View style={styles.forestIntro}>
+          <View style={styles.forestIllustration}>
+            <Ionicons name="git-branch" size={28} color="#4F6B5B" />
+          </View>
+          <View style={styles.forestIntroCopy}>
+            <Text style={styles.forestIntroTitle}>Build places your way.</Text>
+            <Text style={styles.forestIntroText}>A pin can hold smaller places forever: Home → Kitchen, or Square → Cat Café → Upstairs.</Text>
+          </View>
+        </View>
+        <PrimaryButton label="Create a place" onPress={() => setEditing({ place: null, parentId: null })} />
+        <Text style={styles.placeSectionTitle}>Your top-level places</Text>
+        {loading && !places.length ? <ActivityIndicator color="#262624" style={styles.placeLoader} /> : null}
+        {roots.length ? (
+          <View style={styles.placeBranchList}>
+            {roots.map((place) => (
+              <PlaceBranchRow key={place.id} place={place} onPress={() => setSelectedPlaceId(place.id)} />
+            ))}
+          </View>
+        ) : !loading ? (
+          <View style={styles.emptyForest}>
+            <BrandMark size={62} />
+            <Text style={styles.emptyForestTitle}>Your forest starts with one place.</Text>
+            <Text style={styles.placeEmptyText}>Try Home, a neighborhood, your favorite café, or an online world.</Text>
+          </View>
+        ) : null}
+      </ScrollView>
+    </View>
+  );
+}
+
+function PlaceBranchRow({ place, onPress }: { place: Place; onPress: () => void }) {
+  return (
+    <Pressable style={({ pressed }) => [styles.placeBranchRow, pressed && styles.memoryCardPressed]} onPress={onPress}>
+      <View style={styles.placeBranchIcon}>
+        <Ionicons name={place.child_count ? 'git-branch-outline' : 'location-outline'} size={19} color="#765D45" />
+      </View>
+      <View style={styles.placeBranchCopy}>
+        <Text style={styles.placeBranchName}>{place.name}</Text>
+        <Text style={styles.placeBranchMeta}>
+          {place.child_count ? `${place.child_count} inside · ` : ''}{place.memory_count} memories
+        </Text>
+      </View>
+      <Ionicons name="chevron-forward" size={18} color="#9A9A94" />
+    </Pressable>
+  );
+}
+
+function PlaceEditorScreen({ places, place, initialParentId, request, onSaved, onCancel }: {
+  places: Place[];
+  place: Place | null;
+  initialParentId: number | null;
+  request: Requester;
+  onSaved: (place: Place) => Promise<void>;
+  onCancel: () => void;
+}) {
+  const [name, setName] = useState(place?.name || '');
+  const [parentId, setParentId] = useState<number | null>(place?.parent_id ?? initialParentId);
+  const [coordinates, setCoordinates] = useState<Coordinates | null>(
+    place?.lat !== null && place?.lat !== undefined && place.lon !== null
+      ? { lat: place.lat, lon: place.lon }
+      : null,
+  );
+  const [locating, setLocating] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
+  const parentChoices = places.filter((candidate) => (
+    !place || (candidate.id !== place.id && !candidate.path.some((item) => item.id === place.id))
+  ));
+  const selectedParent = places.find((candidate) => candidate.id === parentId) || null;
+
+  async function useCurrentLocation() {
+    setLocating(true);
+    setError('');
+    try {
+      let permission = await Location.getForegroundPermissionsAsync();
+      if (!permission.granted && permission.canAskAgain) {
+        permission = await Location.requestForegroundPermissionsAsync();
+      }
+      if (!permission.granted) throw new Error('Allow location access to pin this place. You can also leave it as a folder.');
+      const current = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced });
+      setCoordinates({ lat: current.coords.latitude, lon: current.coords.longitude });
+    } catch (locationError) {
+      setError(errorMessage(locationError));
+    } finally {
+      setLocating(false);
+    }
+  }
+
+  async function savePlace() {
+    if (!name.trim()) {
+      setError('Give this place a name first.');
+      return;
+    }
+    setSaving(true);
+    setError('');
+    try {
+      const saved = await request(place ? `/places/${place.id}` : '/places', {
+        method: place ? 'PATCH' : 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: name.trim(),
+          parent_id: parentId,
+          lat: coordinates?.lat ?? null,
+          lon: coordinates?.lon ?? null,
+        }),
+      }) as Place;
+      await onSaved(saved);
+    } catch (saveError) {
+      setError(errorMessage(saveError));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <View style={styles.fill}>
+      <PageHeader title={place ? 'Edit place' : 'New place'} subtitle="You stay in control" onBack={onCancel} />
+      <KeyboardAvoidingView style={styles.fill} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
+        <ScrollView contentContainerStyle={styles.placeEditorContent} keyboardShouldPersistTaps="handled">
+          <View style={styles.editorSection}>
+            <Text style={styles.editorLabel}>Name</Text>
+            <TextInput
+              value={name}
+              onChangeText={setName}
+              placeholder="Home, Cat Café, Upstairs…"
+              placeholderTextColor="#8B8B85"
+              autoFocus={!place}
+              style={styles.placeNameInput}
+            />
+          </View>
+
+          <View style={styles.editorSection}>
+            <Text style={styles.editorLabel}>Put it inside</Text>
+            <Text style={styles.editorHelp}>Choose a parent, or leave it at the top of your forest.</Text>
+            <Pressable
+              onPress={() => setParentId(null)}
+              style={[styles.placeChoiceRow, parentId === null && styles.placeChoiceRowSelected]}
+            >
+              <Ionicons name={parentId === null ? 'checkmark-circle' : 'ellipse-outline'} size={18} color={parentId === null ? '#4F6B5B' : '#A0A09A'} />
+              <Text style={[styles.placeChoiceRowText, parentId === null && styles.placeChoiceRowTextSelected]}>Top level</Text>
+            </Pressable>
+            {parentChoices.map((candidate) => {
+              const selected = parentId === candidate.id;
+              return (
+                <Pressable
+                  key={candidate.id}
+                  onPress={() => setParentId(candidate.id)}
+                  style={[styles.placeChoiceRow, selected && styles.placeChoiceRowSelected]}
+                >
+                  <Ionicons name={selected ? 'checkmark-circle' : 'ellipse-outline'} size={18} color={selected ? '#4F6B5B' : '#A0A09A'} />
+                  <Text style={[styles.placeChoiceRowText, selected && styles.placeChoiceRowTextSelected]}>{candidate.path_label}</Text>
+                </Pressable>
+              );
+            })}
+          </View>
+
+          <View style={styles.editorSection}>
+            <Text style={styles.editorLabel}>Map pin</Text>
+            <Text style={styles.editorHelp}>
+              {coordinates
+                ? 'This place has its own GPS pin.'
+                : selectedParent?.effective_lat !== null && selectedParent?.effective_lat !== undefined
+                  ? `It will inherit ${selectedParent.name}’s pin unless you add its own.`
+                  : 'Optional. Folders and indoor areas work without their own GPS.'}
+            </Text>
+            {coordinates ? (
+              <View style={styles.savedPinRow}>
+                <Ionicons name="location" size={18} color="#4F6B5B" />
+                <Text style={styles.savedPinText}>Pin ready</Text>
+                <Pressable onPress={() => setCoordinates(null)}><Text style={styles.removePinText}>Remove</Text></Pressable>
+              </View>
+            ) : (
+              <Pressable style={styles.useLocationButton} onPress={useCurrentLocation} disabled={locating}>
+                {locating ? <ActivityIndicator size="small" color="#4F6B5B" /> : <Ionicons name="locate-outline" size={18} color="#4F6B5B" />}
+                <Text style={styles.useLocationText}>{locating ? 'Finding you…' : 'Use my current location'}</Text>
+              </Pressable>
+            )}
+          </View>
+
+          {error ? <Text style={styles.editorError}>{error}</Text> : null}
+          <PrimaryButton label={saving ? 'Saving…' : place ? 'Save place' : 'Create place'} onPress={savePlace} disabled={saving} />
+          <Pressable style={styles.cancelEditButton} onPress={onCancel} disabled={saving}>
+            <Text style={styles.cancelEditText}>Cancel</Text>
+          </Pressable>
+        </ScrollView>
+      </KeyboardAvoidingView>
+    </View>
+  );
+}
+
 function MemoryCard({ memory, apiUrl, apiKey, compact = false, onPress }: {
   memory: Memory;
   apiUrl: string;
@@ -1323,6 +1730,7 @@ function MemoryDetailScreen({
   request,
   knownTags,
   knownMoods,
+  places,
   onBack,
   onSaved,
 }: {
@@ -1332,6 +1740,7 @@ function MemoryDetailScreen({
   request: Requester;
   knownTags: string[];
   knownMoods: string[];
+  places: Place[];
   onBack: () => void;
   onSaved: (memory: Memory) => void;
 }) {
@@ -1341,6 +1750,8 @@ function MemoryDetailScreen({
   const [moods, setMoods] = useState(splitStoredMoods(memory.mood));
   const [contextType, setContextType] = useState<MemoryContext>(memory.context_type || 'unknown');
   const [shoppingStatus, setShoppingStatus] = useState<ShoppingStatus | null>(memory.shopping_status || null);
+  const [placeId, setPlaceId] = useState<number | null>(memory.place_id || null);
+  const [placeSuggestions, setPlaceSuggestions] = useState<Place[]>([]);
   const [tagDraft, setTagDraft] = useState('');
   const [moodDraft, setMoodDraft] = useState('');
   const [saving, setSaving] = useState(false);
@@ -1353,12 +1764,30 @@ function MemoryDetailScreen({
     setMoods(splitStoredMoods(memory.mood));
     setContextType(memory.context_type || 'unknown');
     setShoppingStatus(memory.shopping_status || null);
+    setPlaceId(memory.place_id || null);
     setTagDraft('');
     setMoodDraft('');
     setSaveError('');
   }, [memory.id]);
 
+  useEffect(() => {
+    let active = true;
+    if (memory.lat === null || memory.lon === null) {
+      setPlaceSuggestions([]);
+      return () => { active = false; };
+    }
+    request(`/places/suggestions?lat=${encodeURIComponent(memory.lat)}&lon=${encodeURIComponent(memory.lon)}`)
+      .then((suggestions: Place[]) => {
+        if (active) setPlaceSuggestions(suggestions);
+      })
+      .catch(() => {
+        if (active) setPlaceSuggestions([]);
+      });
+    return () => { active = false; };
+  }, [memory.id, memory.lat, memory.lon, request]);
+
   const description = memory.user_note || memory.bepo_summary || memory.note || 'A saved moment';
+  const assignedPlace = placeForMemory(memory, places);
   const usedTagSuggestions = knownTags.filter((tag) => !tags.includes(tag)).slice(0, 10);
   const moodChoices = [...new Set([...moods, ...knownMoods, ...STARTER_MOODS])];
 
@@ -1389,6 +1818,7 @@ function MemoryDetailScreen({
           mood: moods.length ? moods.join(',') : null,
           context_type: contextType,
           shopping_status: shoppingStatus,
+          place_id: placeId,
         }),
       }) as Memory;
       onSaved(updated);
@@ -1397,6 +1827,7 @@ function MemoryDetailScreen({
       setMoods(splitStoredMoods(updated.mood));
       setContextType(updated.context_type || 'unknown');
       setShoppingStatus(updated.shopping_status || null);
+      setPlaceId(updated.place_id || null);
       setEditing(false);
     } catch (error) {
       setSaveError(errorMessage(error));
@@ -1429,6 +1860,7 @@ function MemoryDetailScreen({
               <Text style={styles.detailDescription}>{description}</Text>
               <View style={styles.detailBadgeRow}>
                 <Text style={styles.contextBadge}>{contextLabel(memory.context_type)}</Text>
+                {assignedPlace ? <Text style={styles.placeBadge}>⌖ {assignedPlace.path_label}</Text> : null}
                 {shoppingLabel(memory.shopping_status) ? (
                   <Text style={styles.statusBadge}>{shoppingLabel(memory.shopping_status)}</Text>
                 ) : null}
@@ -1540,6 +1972,61 @@ function MemoryDetailScreen({
                     <Ionicons name="add" size={20} color="#FFFFFF" />
                   </Pressable>
                 </View>
+              </View>
+
+              <View style={styles.editorSection}>
+                <Text style={styles.editorLabel}>Place</Text>
+                <Text style={styles.editorHelp}>You decide where this belongs. Bepo only suggests existing nearby pins.</Text>
+                {placeSuggestions.length ? (
+                  <>
+                    <Text style={styles.placeChoiceHeading}>Nearby suggestions</Text>
+                    <View style={styles.editorChipWrap}>
+                      {placeSuggestions.map((place) => {
+                        const selected = placeId === place.id;
+                        return (
+                          <Pressable
+                            key={`suggested-${place.id}`}
+                            onPress={() => setPlaceId(place.id)}
+                            style={[styles.placeChoice, selected && styles.placeChoiceSelected]}
+                          >
+                            <Ionicons name="location-outline" size={15} color={selected ? '#765D45' : '#65655F'} />
+                            <View style={styles.placeChoiceCopy}>
+                              <Text style={[styles.placeChoiceName, selected && styles.placeChoiceNameSelected]}>{place.path_label}</Text>
+                              {place.distance_m !== undefined ? <Text style={styles.placeChoiceMeta}>{place.distance_m} m away</Text> : null}
+                            </View>
+                          </Pressable>
+                        );
+                      })}
+                    </View>
+                  </>
+                ) : null}
+                {places.length ? (
+                  <>
+                    <Text style={styles.placeChoiceHeading}>All places</Text>
+                    <View style={styles.placeChoiceList}>
+                      {places.map((place) => {
+                        const selected = placeId === place.id;
+                        return (
+                          <Pressable
+                            key={place.id}
+                            onPress={() => setPlaceId(place.id)}
+                            style={[styles.placeChoiceRow, selected && styles.placeChoiceRowSelected]}
+                          >
+                            <Ionicons name={selected ? 'checkmark-circle' : 'ellipse-outline'} size={18} color={selected ? '#4F6B5B' : '#A0A09A'} />
+                            <Text style={[styles.placeChoiceRowText, selected && styles.placeChoiceRowTextSelected]}>{place.path_label}</Text>
+                          </Pressable>
+                        );
+                      })}
+                    </View>
+                    {placeId ? (
+                      <Pressable onPress={() => setPlaceId(null)} style={styles.clearPlaceButton}>
+                        <Text style={styles.clearChoiceText}>Remove from this place</Text>
+                      </Pressable>
+                    ) : null}
+                  </>
+                ) : (
+                  <Text style={styles.emptyPlaceHelp}>Create your first place from the branching icon on Bepo’s home screen.</Text>
+                )}
               </View>
 
               <View style={styles.editorSection}>
@@ -1686,4 +2173,3 @@ function PrimaryButton({ label, onPress, disabled = false }: { label: string; on
     </Pressable>
   );
 }
-

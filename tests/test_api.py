@@ -552,6 +552,117 @@ class TestPatchMemoryMetadata:
         assert data["matches"][0]["place_hint"] == "purple bicycle rack"
 
 
+class TestPlaces:
+    def test_creates_a_manual_place_forest_with_inherited_pin(self, client):
+        home = client.post(
+            "/places", json={"name": "Home", "lat": 52.23, "lon": 21.01}
+        )
+        assert home.status_code == 200
+        home_data = home.json()
+        kitchen = client.post(
+            "/places", json={"name": "Kitchen", "parent_id": home_data["id"]}
+        )
+        assert kitchen.status_code == 200
+        kitchen_data = kitchen.json()
+
+        assert kitchen_data["path_label"] == "Home › Kitchen"
+        assert kitchen_data["effective_lat"] == pytest.approx(52.23)
+        assert kitchen_data["effective_lon"] == pytest.approx(21.01)
+        assert kitchen_data["pin_inherited"] is True
+
+        places = client.get("/places").json()
+        assert [place["path_label"] for place in places] == ["Home", "Home › Kitchen"]
+        assert places[0]["child_count"] == 1
+
+    def test_rejects_missing_parent_and_duplicate_sibling_name(self, client):
+        missing = client.post("/places", json={"name": "Bedroom", "parent_id": 999})
+        assert missing.status_code == 422
+
+        home_id = client.post("/places", json={"name": "Home"}).json()["id"]
+        first = client.post("/places", json={"name": "Bedroom", "parent_id": home_id})
+        duplicate = client.post("/places", json={"name": "bedroom", "parent_id": home_id})
+        assert first.status_code == 200
+        assert duplicate.status_code == 409
+
+    def test_prevents_reparenting_cycle(self, client):
+        home_id = client.post("/places", json={"name": "Home"}).json()["id"]
+        room_id = client.post(
+            "/places", json={"name": "Room", "parent_id": home_id}
+        ).json()["id"]
+
+        response = client.patch(f"/places/{home_id}", json={"parent_id": room_id})
+
+        assert response.status_code == 422
+        assert "cannot be inside" in response.json()["detail"]
+
+    def test_assigns_memory_and_parent_includes_nested_memories(self, client):
+        home_id = client.post("/places", json={"name": "Home"}).json()["id"]
+        kitchen_id = client.post(
+            "/places", json={"name": "Kitchen", "parent_id": home_id}
+        ).json()["id"]
+        memory_id = client.post(
+            "/memory",
+            files={"photo": ("img.jpg", _tiny_jpeg(), "image/jpeg")},
+            data={"note": "tea shelf"},
+        ).json()["memory_id"]
+
+        assigned = client.patch(
+            f"/memory/{memory_id}/metadata", json={"place_id": kitchen_id}
+        )
+
+        assert assigned.status_code == 200
+        assert assigned.json()["place_id"] == kitchen_id
+        kitchen = client.get(f"/places/{kitchen_id}").json()
+        home = client.get(f"/places/{home_id}").json()
+        assert [memory["id"] for memory in kitchen["memories"]] == [memory_id]
+        assert [memory["id"] for memory in home["memories"]] == [memory_id]
+        assert home["memory_count"] == 1
+        assert home["direct_memory_count"] == 0
+
+    def test_nearby_suggestions_only_return_existing_explicit_pins(self, client):
+        cafe_id = client.post(
+            "/places", json={"name": "Cat Cafe", "lat": 50.061, "lon": 19.938}
+        ).json()["id"]
+        child_id = client.post(
+            "/places", json={"name": "Upstairs", "parent_id": cafe_id}
+        ).json()["id"]
+        client.post(
+            "/places", json={"name": "Far Cafe", "lat": 51.1, "lon": 19.9}
+        )
+        memory_id = client.post(
+            "/memory",
+            files={"photo": ("nearby.jpg", _tiny_jpeg(), "image/jpeg")},
+            data={"lat": "50.06", "lon": "19.94"},
+        ).json()["memory_id"]
+
+        suggestions = client.get(
+            "/places/suggestions",
+            params={"lat": 50.06, "lon": 19.94, "radius_m": 1000},
+        )
+
+        assert suggestions.status_code == 200
+        data = suggestions.json()
+        assert [place["id"] for place in data] == [cafe_id]
+        assert child_id not in [place["id"] for place in data]
+        assert data[0]["distance_m"] < 1000
+        assert client.get(f"/memory/{memory_id}").json()["place_id"] is None
+
+    def test_memory_assignment_rejects_unknown_place_and_can_be_cleared(self, client):
+        place_id = client.post("/places", json={"name": "Library"}).json()["id"]
+        memory_id = client.post(
+            "/memory",
+            files={"photo": ("img.jpg", _tiny_jpeg(), "image/jpeg")},
+            data={"place_id": str(place_id)},
+        ).json()["memory_id"]
+        assert client.get(f"/memory/{memory_id}").json()["place_id"] == place_id
+
+        invalid = client.patch(f"/memory/{memory_id}/metadata", json={"place_id": 999})
+        assert invalid.status_code == 422
+        cleared = client.patch(f"/memory/{memory_id}/metadata", json={"place_id": None})
+        assert cleared.status_code == 200
+        assert cleared.json()["place_id"] is None
+
+
 class TestSearch:
     def test_no_results_on_empty_database(self, client):
         r = client.post("/search", data={"query": "sunset"})
@@ -917,6 +1028,7 @@ class TestInitDbMigration:
                 "taken_at", "taken_at_source", "location_source",
                 "note_created_at", "note_updated_at",
                 "context_type", "shopping_status", "shopping_status_updated_at",
+                "place_id",
             }.issubset(columns)
 
             cursor2.execute(
@@ -931,6 +1043,7 @@ class TestInitDbMigration:
             )
             cursor2.execute("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'memory_status_history'")
             assert cursor2.fetchone() is not None
+            cursor2.execute("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'places'")
+            assert cursor2.fetchone() is not None
         finally:
             conn2.close()
-
