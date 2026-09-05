@@ -27,6 +27,11 @@ DB_PATH = os.getenv("BEPO_DB_PATH") or os.path.join(DATA_DIR, "memories.db")
 IMAGES_DIR = os.getenv("BEPO_IMAGES_DIR") or os.path.join(DATA_DIR, "images")
 API_KEY = os.getenv("BEPO_API_KEY") or None
 
+# Keep the downloaded visual model on Bepo's persistent Railway volume. The
+# first CLIP startup downloads the model; later deploys can reuse that cache.
+MODEL_CACHE_DIR = os.getenv("BEPO_MODEL_CACHE_DIR") or os.path.join(DATA_DIR, "model-cache")
+os.environ.setdefault("HF_HOME", MODEL_CACHE_DIR)
+
 
 def env_flag(name: str, default: bool = False) -> bool:
     """Return a boolean environment flag with conservative parsing."""
@@ -38,6 +43,7 @@ def env_flag(name: str, default: bool = False) -> bool:
 # CLIP is opt-in so small hosted deployments can start quickly and reliably.
 # Install requirements-clip.txt and set BEPO_ENABLE_CLIP=1 to enable it.
 USE_CLIP = env_flag("BEPO_ENABLE_CLIP")
+CLIP_MIN_SIMILARITY = float(os.getenv("BEPO_CLIP_MIN_SIMILARITY", "0.22"))
 model = None
 processor = None
 
@@ -56,6 +62,7 @@ async def lifespan(app: FastAPI):
     # Startup
     init_db()
     init_model()
+    refresh_embeddings_for_active_model()
     yield
     # Shutdown (cleanup if needed)
     pass
@@ -180,6 +187,7 @@ def init_model():
         return
     
     try:
+        os.makedirs(MODEL_CACHE_DIR, exist_ok=True)
         print("Loading CLIP model...")
         model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
         processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
@@ -640,6 +648,85 @@ def build_combined_text(*fields: Optional[str]) -> Optional[str]:
     return "\n".join(parts)
 
 
+def active_embedding_size() -> int:
+    """Return the vector size produced by the currently active model."""
+    if USE_CLIP and model is not None:
+        return int(getattr(model.config, "projection_dim", 512))
+    return 128
+
+
+def stored_embedding_size(value: Optional[bytes]) -> Optional[int]:
+    """Return a stored vector's size, treating unreadable data as incompatible."""
+    if value is None:
+        return None
+    try:
+        return int(deserialize_embedding(value).reshape(-1).size)
+    except Exception:
+        return None
+
+
+def refresh_embeddings_for_active_model() -> dict:
+    """Upgrade saved memories when Bepo switches embedding models.
+
+    Railway originally used 128-dimensional lightweight vectors while CLIP
+    uses 512-dimensional vectors. Rebuilding incompatible rows at startup lets
+    existing photos gain visual search without asking the user to re-upload.
+    """
+    expected_size = active_embedding_size()
+    conn = get_db_connection()
+    refreshed_images = 0
+    refreshed_text = 0
+    skipped_images = 0
+    try:
+        rows = conn.execute(
+            "SELECT id, image_path, image_emb, text_emb, text_note, user_note, "
+            "bepo_summary, tags, mood, place_hint, taken_at FROM memories"
+        ).fetchall()
+        for row in rows:
+            updates = {}
+            if stored_embedding_size(row["image_emb"]) != expected_size:
+                try:
+                    with Image.open(row["image_path"]) as stored_image:
+                        rgb_image = stored_image.convert("RGB")
+                        updates["image_emb"] = serialize_embedding(get_image_embedding(rgb_image))
+                    refreshed_images += 1
+                except Exception as exc:
+                    skipped_images += 1
+                    print(f"Could not refresh image embedding for memory {row['id']}: {exc}")
+
+            combined_text = build_combined_text(
+                row["text_note"],
+                row["user_note"],
+                row["bepo_summary"],
+                row["tags"],
+                row["mood"],
+                row["place_hint"],
+                datetime_search_text(row["taken_at"]),
+            )
+            if combined_text is not None and stored_embedding_size(row["text_emb"]) != expected_size:
+                updates["text_emb"] = serialize_embedding(get_text_embedding(combined_text))
+                refreshed_text += 1
+
+            if updates:
+                assignments = ", ".join(f"{field} = ?" for field in updates)
+                conn.execute(
+                    f"UPDATE memories SET {assignments} WHERE id = ?",
+                    (*updates.values(), row["id"]),
+                )
+        conn.commit()
+    finally:
+        conn.close()
+
+    result = {
+        "embedding_size": expected_size,
+        "images": refreshed_images,
+        "text": refreshed_text,
+        "skipped_images": skipped_images,
+    }
+    print(f"Embedding refresh complete: {result}")
+    return result
+
+
 def normalize_datetime_value(value: Optional[str], field_name: str) -> Optional[str]:
     """Validate an optional ISO date/time while preserving its supplied timezone."""
     if value is None or not value.strip():
@@ -800,6 +887,47 @@ def parse_memory_query(query: str, known_moods: set[str]) -> dict:
     }
 
 
+SEARCH_FILLER_WORDS = {
+    "a", "an", "and", "are", "can", "could", "did", "do", "for", "from",
+    "give", "have", "i", "in", "is", "me", "memory", "memories", "my", "of",
+    "on", "photo", "photos", "picture", "pictures", "please", "show", "that",
+    "the", "these", "those", "to", "was", "were", "where", "with", "you",
+}
+
+
+def normalized_search_tokens(value: Optional[str]) -> set[str]:
+    """Extract useful search words with a tiny plural normalization."""
+    if not value:
+        return set()
+    tokens = set()
+    for token in re.findall(r"[\w-]+", value.casefold()):
+        if token in SEARCH_FILLER_WORDS:
+            continue
+        if len(token) > 4 and token.endswith("s") and not token.endswith("ss"):
+            token = token[:-1]
+        if token and token not in SEARCH_FILLER_WORDS:
+            tokens.add(token)
+    return tokens
+
+
+def lexical_relevance(query: str, row: sqlite3.Row) -> float:
+    """Return direct word overlap so hosted search never dumps unrelated rows."""
+    searchable = build_combined_text(
+        row["text_note"],
+        row["user_note"],
+        row["bepo_summary"],
+        row["tags"],
+        row["mood"],
+        row["place_hint"],
+        datetime_search_text(row["taken_at"]),
+    ) or ""
+    query_tokens = normalized_search_tokens(query)
+    if not query_tokens:
+        return 0.0
+    searchable_tokens = normalized_search_tokens(searchable)
+    return len(query_tokens & searchable_tokens) / len(query_tokens)
+
+
 def haversine_distance_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     """Return the great-circle distance between two coordinates in kilometers."""
     earth_radius_km = 6371.0088
@@ -847,6 +975,7 @@ def search_memory_matches_with_filters(
 
     semantic_query = filters["semantic_query"]
     query_emb = get_text_embedding(semantic_query) if semantic_query else None
+    clip_ready = USE_CLIP and model is not None
 
     scored = []
     for row in rows:
@@ -874,17 +1003,26 @@ def search_memory_matches_with_filters(
         ):
             continue
 
-        image_score = 1.0
+        image_score = 1.0 if query_emb is None else -1.0
         if query_emb is not None:
-            image_emb = deserialize_embedding(row["image_emb"])
-            image_score = cosine_similarity(query_emb, image_emb)
+            try:
+                image_emb = deserialize_embedding(row["image_emb"])
+                if image_emb.size == query_emb.size:
+                    image_score = cosine_similarity(query_emb, image_emb)
+            except Exception:
+                image_score = -1.0
 
         text_score = -1.0
         if query_emb is not None and row["text_emb"] is not None:
-            text_emb_arr = deserialize_embedding(row["text_emb"])
-            text_score = cosine_similarity(query_emb, text_emb_arr)
+            try:
+                text_emb_arr = deserialize_embedding(row["text_emb"])
+                if text_emb_arr.size == query_emb.size:
+                    text_score = cosine_similarity(query_emb, text_emb_arr)
+            except Exception:
+                text_score = -1.0
 
-        score = max(image_score, text_score)
+        lexical_score = lexical_relevance(semantic_query, row) if semantic_query else 0.0
+        score = max(image_score, text_score, lexical_score)
         memory_id = row["id"]
         lat = row["lat"]
         lon = row["lon"]
@@ -917,7 +1055,17 @@ def search_memory_matches_with_filters(
             "map_url": build_map_url(lat, lon),
             "distance_km": distance_km,
             "score": score,
+            "_lexical_score": lexical_score,
         })
+
+    if semantic_query:
+        if clip_ready:
+            scored = [
+                item for item in scored
+                if item["_lexical_score"] > 0 or item["score"] >= CLIP_MIN_SIMILARITY
+            ]
+        else:
+            scored = [item for item in scored if item["_lexical_score"] > 0]
 
     if filters["nearby"]:
         scored.sort(key=lambda item: (item["distance_km"], -item["score"]))
@@ -925,7 +1073,10 @@ def search_memory_matches_with_filters(
         scored.sort(key=lambda item: item["score"], reverse=True)
     else:
         scored.sort(key=lambda item: item["taken_at"] or item["timestamp"], reverse=True)
-    return scored[:top_k], filters, False
+    matches = scored[:top_k]
+    for item in matches:
+        item.pop("_lexical_score", None)
+    return matches, filters, False
 
 
 def search_memory_matches(query: str, top_k: int) -> list:
@@ -1549,7 +1700,7 @@ async def root():
     """Root endpoint with API information"""
     return {
         "app": "Bepo",
-        "version": "0.9",
+        "version": "1.0",
         "description": "Memory storage and search with image and text embeddings",
         "endpoints": {
             "POST /memory": "Store a new memory with photo, note, and GPS",
@@ -1575,7 +1726,11 @@ app.include_router(router)
 @app.get("/health", include_in_schema=False)
 async def health():
     """Return a public liveness response for deployment health checks."""
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "visual_search": USE_CLIP and model is not None,
+        "embedding_size": active_embedding_size(),
+    }
 
 if __name__ == "__main__":
     uvicorn.run(

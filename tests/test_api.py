@@ -85,7 +85,11 @@ class TestRoot:
         monkeypatch.setattr(app_module, "API_KEY", "test-secret")
         r = client.get("/health")
         assert r.status_code == 200
-        assert r.json() == {"status": "ok"}
+        assert r.json() == {
+            "status": "ok",
+            "visual_search": False,
+            "embedding_size": 128,
+        }
 
     def test_configured_api_key_protects_application_routes(self, client, monkeypatch):
         monkeypatch.setattr(app_module, "API_KEY", "test-secret")
@@ -664,6 +668,38 @@ class TestPlaces:
 
 
 class TestSearch:
+    def test_refreshes_old_embeddings_for_the_active_model(self, client):
+        memory_id = client.post(
+            "/memory",
+            files={"photo": ("img.jpg", _tiny_jpeg(), "image/jpeg")},
+            data={"note": "sunset at the beach"},
+        ).json()["memory_id"]
+        wrong_size = app_module.serialize_embedding(np.array([1.0, 2.0, 3.0], dtype=np.float32))
+        conn = sqlite3.connect(app_module.DB_PATH)
+        try:
+            conn.execute(
+                "UPDATE memories SET image_emb = ?, text_emb = ? WHERE id = ?",
+                (wrong_size, wrong_size, memory_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        result = app_module.refresh_embeddings_for_active_model()
+        conn = sqlite3.connect(app_module.DB_PATH)
+        try:
+            row = conn.execute(
+                "SELECT image_emb, text_emb FROM memories WHERE id = ?", (memory_id,)
+            ).fetchone()
+        finally:
+            conn.close()
+
+        assert result["embedding_size"] == 128
+        assert result["images"] == 1
+        assert result["text"] == 1
+        assert app_module.deserialize_embedding(row[0]).size == 128
+        assert app_module.deserialize_embedding(row[1]).size == 128
+
     def test_no_results_on_empty_database(self, client):
         r = client.post("/search", data={"query": "sunset"})
         assert r.status_code == 200
@@ -691,6 +727,37 @@ class TestSearch:
         assert "tags" in match
         assert "mood" in match
         assert "place_hint" in match
+
+    def test_unrelated_query_does_not_dump_all_memories(self, client):
+        for note in ["grocery receipt", "cat asleep on the sofa", "train ticket"]:
+            client.post(
+                "/memory",
+                files={"photo": ("img.jpg", _tiny_jpeg(), "image/jpeg")},
+                data={"note": note},
+            )
+
+        r = client.post("/search", data={"query": "show me my sunset pictures", "top_k": "5"})
+
+        assert r.status_code == 200
+        assert r.json()["status"] == "no_results"
+        assert r.json()["matches"] == []
+
+    def test_text_match_excludes_unrelated_memories_in_lightweight_mode(self, client):
+        client.post(
+            "/memory",
+            files={"photo": ("sunset.jpg", _tiny_jpeg(), "image/jpeg")},
+            data={"note": "pink sunset over the water"},
+        )
+        client.post(
+            "/memory",
+            files={"photo": ("receipt.jpg", _tiny_jpeg(), "image/jpeg")},
+            data={"note": "grocery receipt"},
+        )
+
+        data = client.post("/search", data={"query": "my sunset photos", "top_k": "5"}).json()
+
+        assert data["status"] == "success"
+        assert [match["note"] for match in data["matches"]] == ["pink sunset over the water"]
 
     def test_post_with_mood_tags_place_hint_works(self, client):
         r = client.post(
