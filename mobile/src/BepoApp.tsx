@@ -1470,9 +1470,26 @@ function ChatBubble({ message, apiUrl, apiKey, onChoosePlace, onOpenPlaces }: {
             <Text style={styles.createPlaceSuggestionText}>Open Places to create “{message.suggestedPlaceName}”</Text>
           </Pressable>
         ) : null}
-        {message.memories?.map((memory) => (
-          <MemoryCard key={memory.id} memory={memory} apiUrl={apiUrl} apiKey={apiKey} compact />
-        ))}
+        {message.memories?.length ? (
+          <View style={styles.memoryCarouselWrap}>
+            <ScrollView
+              horizontal
+              showsHorizontalScrollIndicator={false}
+              nestedScrollEnabled
+              decelerationRate="fast"
+              snapToInterval={250}
+              snapToAlignment="start"
+              contentContainerStyle={styles.memoryCarousel}
+            >
+              {message.memories.map((memory) => (
+                <MemoryCard key={memory.id} memory={memory} apiUrl={apiUrl} apiKey={apiKey} compact />
+              ))}
+            </ScrollView>
+            {message.memories.length > 1 ? (
+              <Text style={styles.memoryCarouselHint}>Swipe to see {message.memories.length} memories</Text>
+            ) : null}
+          </View>
+        ) : null}
       </View>
     </View>
   );
