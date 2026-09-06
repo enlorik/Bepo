@@ -11,6 +11,8 @@ The native Expo/React Native client for Bepo. It connects to the private Bepo AP
 - Browse all saved memories
 - Search by image/text meaning
 - Ask Bepo natural-language questions about saved memories
+- Type a saved place naturally or use `@place` suggestions; the removable place chip searches that whole branch
+- Assign a new photo to a manual place with the same `@place` picker, independently of its GPS metadata
 - Store the Railway API key in iOS Keychain or Android Keystore through Expo SecureStore
 
 The Railway API URL is prefilled. The API key is deliberately **not** committed to this repository or embedded in the app. Paste `BEPO_API_KEY` during the one-time connection screen.

@@ -172,6 +172,8 @@ class ChatRequest(BaseModel):
     top_k: int = Field(default=3, ge=1, le=10)
     lat: Optional[float] = Field(default=None, ge=-90, le=90)
     lon: Optional[float] = Field(default=None, ge=-180, le=180)
+    place_id: Optional[int] = Field(default=None, ge=1)
+    detect_places: bool = True
 
     @field_validator("message")
     @classmethod
@@ -526,6 +528,25 @@ def place_to_response(conn: sqlite3.Connection, row: sqlite3.Row) -> dict:
     }
 
 
+def place_to_search_record(conn: sqlite3.Connection, row: sqlite3.Row) -> dict:
+    """Return the small, stable place shape used by conversational search."""
+    path_rows = place_path_rows(conn, row["id"])
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "path": [{"id": item["id"], "name": item["name"]} for item in path_rows],
+        "path_label": " › ".join(item["name"] for item in path_rows),
+    }
+
+
+def list_place_search_records(conn: sqlite3.Connection) -> list[dict]:
+    """Return every manual place without the heavier counts used by /places."""
+    rows = conn.execute(
+        "SELECT id, name, parent_id, lat, lon, created_at, updated_at FROM places"
+    ).fetchall()
+    return [place_to_search_record(conn, row) for row in rows]
+
+
 def validate_place_parent(
     conn: sqlite3.Connection,
     parent_id: Optional[int],
@@ -801,9 +822,103 @@ def remove_query_phrase(value: str, pattern: str) -> str:
     return re.sub(pattern, " ", value, flags=re.IGNORECASE)
 
 
-def parse_memory_query(query: str, known_moods: set[str]) -> dict:
+def normalize_place_term(value: str) -> str:
+    """Normalize typed @place terms and saved names for matching."""
+    return re.sub(r"\s+", " ", value.replace("-", " ").replace("_", " ")).strip().casefold()
+
+
+def place_name_pattern(name: str) -> str:
+    """Build a word-bounded pattern that tolerates spaces, hyphens, and underscores."""
+    words = re.findall(r"\w+", normalize_place_term(name), flags=re.UNICODE)
+    if not words:
+        return r"(?!)"
+    separator = r"[\s_-]+"
+    return rf"(?<!\w){separator.join(re.escape(word) for word in words)}(?!\w)"
+
+
+def resolve_place_query(
+    query: str,
+    known_places: list[dict],
+    selected_place_id: Optional[int] = None,
+    detect_implicit_places: bool = True,
+) -> tuple[str, Optional[dict], list[dict], Optional[str]]:
+    """Resolve an explicit or conversational place reference without using GPS."""
+    working = query
+    by_id = {place["id"]: place for place in known_places}
+
+    if selected_place_id is not None:
+        selected = by_id.get(selected_place_id)
+        if selected is None:
+            raise HTTPException(status_code=422, detail=f"Place {selected_place_id} not found")
+        working = remove_query_phrase(working, place_name_pattern(selected["name"]))
+        working = re.sub(r"(?<!\S)@[\w-]+", " ", working, flags=re.UNICODE)
+        return working, selected, [], None
+
+    explicit = re.search(r"(?<!\S)@([\w-]+)", working, flags=re.UNICODE)
+    if explicit:
+        raw_term = explicit.group(1)
+        term = normalize_place_term(raw_term)
+        matches = [
+            place
+            for place in known_places
+            if normalize_place_term(place["name"]) == term
+            or normalize_place_term(place["path_label"].replace("›", " ")) == term
+        ]
+        working = f"{working[:explicit.start()]} {working[explicit.end():]}"
+        if len(matches) == 1:
+            return working, matches[0], [], None
+        if len(matches) > 1:
+            return working, None, sorted(matches, key=lambda item: item["path_label"].casefold()), None
+        return working, None, [], term or None
+
+    if not detect_implicit_places:
+        return working, None, [], None
+
+    matched_groups: dict[str, dict] = {}
+    for place in known_places:
+        normalized_name = normalize_place_term(place["name"])
+        if not normalized_name or not re.search(place_name_pattern(place["name"]), working, flags=re.IGNORECASE):
+            continue
+        group = matched_groups.setdefault(
+            normalized_name,
+            {
+                "places": [],
+                "specificity": (
+                    len(normalized_name.split()),
+                    len(normalized_name),
+                    len(place["path"]),
+                ),
+            },
+        )
+        group["places"].append(place)
+        group["specificity"] = max(
+            group["specificity"],
+            (len(normalized_name.split()), len(normalized_name), len(place["path"])),
+        )
+
+    if not matched_groups:
+        return working, None, [], None
+
+    most_specific = max(matched_groups.values(), key=lambda group: group["specificity"])
+    matches = most_specific["places"]
+    working = remove_query_phrase(working, place_name_pattern(matches[0]["name"]))
+    if len(matches) == 1:
+        return working, matches[0], [], None
+    return working, None, sorted(matches, key=lambda item: item["path_label"].casefold()), None
+
+
+def parse_memory_query(
+    query: str,
+    known_moods: set[str],
+    known_places: Optional[list[dict]] = None,
+    selected_place_id: Optional[int] = None,
+    detect_implicit_places: bool = True,
+) -> dict:
     """Extract exact filters from a conversational memory query."""
     working = query.casefold()
+    working, place, place_options, suggested_place_name = resolve_place_query(
+        working, known_places or [], selected_place_id, detect_implicit_places
+    )
     hashtags = [match.group(1).casefold() for match in re.finditer(r"(?<!\S)#([\w-]+)", working)]
     working = re.sub(r"(?<!\S)#[\w-]+", " ", working)
 
@@ -879,12 +994,18 @@ def parse_memory_query(query: str, known_moods: set[str]) -> dict:
             working = remove_query_phrase(working, pattern)
 
     semantic_query = re.sub(r"\s+", " ", working).strip(" .,?!")
+    if not normalized_search_tokens(semantic_query):
+        semantic_query = ""
     return {
         "tags": list(dict.fromkeys(tags)),
         "moods": list(dict.fromkeys(moods)),
         "context_type": context_type,
         "shopping_status": shopping_status,
         "nearby": nearby,
+        "place_id": place["id"] if place else None,
+        "place": place,
+        "place_options": place_options,
+        "suggested_place_name": suggested_place_name,
         "semantic_query": semantic_query,
     }
 
@@ -892,8 +1013,8 @@ def parse_memory_query(query: str, known_moods: set[str]) -> dict:
 SEARCH_FILLER_WORDS = {
     "a", "an", "and", "are", "can", "could", "did", "do", "for", "from",
     "give", "have", "i", "in", "is", "me", "memory", "memories", "my", "of",
-    "on", "photo", "photos", "picture", "pictures", "please", "show", "that",
-    "the", "these", "those", "to", "was", "were", "where", "with", "you",
+    "on", "photo", "photos", "picture", "pictures", "please", "show", "stuff", "that",
+    "the", "these", "things", "those", "to", "was", "were", "where", "with", "you",
 }
 
 
@@ -982,6 +1103,8 @@ def search_memory_matches_with_filters(
     top_k: int,
     current_lat: Optional[float] = None,
     current_lon: Optional[float] = None,
+    selected_place_id: Optional[int] = None,
+    detect_implicit_places: bool = True,
 ) -> tuple[list, dict, bool]:
     """Return matches, parsed filters, and whether a nearby query needs GPS."""
     conn = get_db_connection()
@@ -995,19 +1118,33 @@ def search_memory_matches_with_filters(
             "FROM memories"
         )
         rows = cursor.fetchall()
+        known_places = list_place_search_records(conn)
+        known_moods = {
+            mood
+            for row in rows
+            for mood in split_metadata_values(row["mood"])
+        }
+        known_moods.update({"calm", "cozy", "happy", "excited", "nostalgic", "safe", "romantic", "sad", "anxious"})
+        filters = parse_memory_query(
+            query,
+            known_moods,
+            known_places,
+            selected_place_id,
+            detect_implicit_places,
+        )
+        filters["_has_memories"] = bool(rows)
+        place_ids = (
+            set(place_descendant_ids(conn, filters["place_id"]))
+            if filters["place_id"] is not None
+            else set()
+        )
     finally:
         conn.close()
 
     if not rows:
-        return [], parse_memory_query(query, set()), False
-
-    known_moods = {
-        mood
-        for row in rows
-        for mood in split_metadata_values(row["mood"])
-    }
-    known_moods.update({"calm", "cozy", "happy", "excited", "nostalgic", "safe", "romantic", "sad", "anxious"})
-    filters = parse_memory_query(query, known_moods)
+        return [], filters, False
+    if filters["place_options"] or filters["suggested_place_name"]:
+        return [], filters, False
     needs_location = filters["nearby"] and (current_lat is None or current_lon is None)
     if needs_location:
         return [], filters, True
@@ -1018,6 +1155,8 @@ def search_memory_matches_with_filters(
 
     scored = []
     for row in rows:
+        if place_ids and row["place_id"] not in place_ids:
+            continue
         row_tags = split_metadata_values(row["tags"])
         if not set(filters["tags"]).issubset(row_tags):
             continue
@@ -1126,15 +1265,22 @@ def search_memory_matches(query: str, top_k: int) -> list:
 
 def public_memory_filters(filters: dict) -> dict:
     """Return only user-facing filters, omitting internal semantic-query text."""
-    return {key: value for key, value in filters.items() if key != "semantic_query" and value not in (None, [], False)}
+    public_keys = {"tags", "moods", "context_type", "shopping_status", "nearby", "place"}
+    return {
+        key: value
+        for key, value in filters.items()
+        if key in public_keys and value not in (None, [], False)
+    }
 
 
 def build_filtered_chat_answer(filters: dict, count: int, top: Optional[dict] = None) -> str:
     """Describe an exact filtered result set in friendly language."""
     nearby = filters.get("nearby")
+    place = filters.get("place")
     noun = "memory" if count == 1 else "memories"
     ordering = " nearby, closest first" if nearby else ""
-    answer = f"I found {count} matching {noun}{ordering}."
+    location = f" in {place['path_label']}" if place else ""
+    answer = f"I found {count} matching {noun}{location}{ordering}."
     if top is not None and count == 1:
         answer = f"{answer} {build_chat_answer(top)}"
     return answer
@@ -1582,6 +1728,7 @@ async def search_memories(
     top_k: int = Form(5),
     lat: Optional[float] = Form(None),
     lon: Optional[float] = Form(None),
+    place_id: Optional[int] = Form(None),
 ):
     """
     Search memories by text query.
@@ -1598,8 +1745,26 @@ async def search_memories(
 
     try:
         matches, filters, needs_location = search_memory_matches_with_filters(
-            query.strip(), top_k, lat, lon
+            query.strip(), top_k, lat, lon, place_id
         )
+
+        if filters["place_options"]:
+            return {
+                "status": "needs_place",
+                "message": "Choose which saved place you mean",
+                "filters": public_memory_filters(filters),
+                "place_options": filters["place_options"],
+                "matches": [],
+            }
+
+        if filters["suggested_place_name"]:
+            return {
+                "status": "no_results",
+                "message": f"No saved place named {filters['suggested_place_name']}",
+                "filters": public_memory_filters(filters),
+                "suggested_place_name": filters["suggested_place_name"],
+                "matches": [],
+            }
 
         if needs_location:
             return {
@@ -1639,9 +1804,36 @@ async def chat(request: ChatRequest):
     """
     try:
         matches, filters, needs_location = search_memory_matches_with_filters(
-            request.message.strip(), request.top_k, request.lat, request.lon
+            request.message.strip(),
+            request.top_k,
+            request.lat,
+            request.lon,
+            request.place_id,
+            request.detect_places,
         )
         applied_filters = public_memory_filters(filters)
+
+        if filters["place_options"]:
+            place_name = filters["place_options"][0]["name"]
+            return {
+                "status": "needs_place",
+                "message": request.message,
+                "answer": f"I found more than one {place_name}. Which place did you mean?",
+                "filters": applied_filters,
+                "place_options": filters["place_options"],
+                "memories": [],
+            }
+
+        if filters["suggested_place_name"]:
+            suggested_name = filters["suggested_place_name"]
+            return {
+                "status": "no_results",
+                "message": request.message,
+                "answer": f"I do not have a place named {suggested_name} yet. Is this a place you want to create?",
+                "filters": applied_filters,
+                "suggested_place_name": suggested_name,
+                "memories": [],
+            }
 
         if needs_location:
             return {
@@ -1653,11 +1845,19 @@ async def chat(request: ChatRequest):
             }
 
         if not matches:
+            place = filters.get("place")
             return {
                 "status": "no_results",
                 "message": request.message,
-                "answer": "I could not find any memories matching those details." if applied_filters
-                else "I do not have any memories saved yet.",
+                "answer": (
+                    f"I could not find any memories in {place['path_label']} yet."
+                    if place
+                    else "I do not have any memories saved yet."
+                    if not filters["_has_memories"]
+                    else "I could not find any memories matching those details."
+                    if applied_filters
+                    else "I do not have any memories saved yet."
+                ),
                 "filters": applied_filters,
                 "memories": [],
             }
@@ -1673,6 +1873,8 @@ async def chat(request: ChatRequest):
             "memories": matches,
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error in chat: {str(e)}")
 

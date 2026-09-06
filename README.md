@@ -258,6 +258,12 @@ Search memories using a text query. Returns the top `top_k` matches ranked by si
 **Parameters:**
 - `query` (string, required): Search query text (must not be empty)
 - `top_k` (int, optional, default 5, min 1, max 20): Number of results to return
+- `place_id` (int, optional): Explicitly search one manual place and all of its descendants
+
+Saved place names are also recognized in conversational text. `@bedroom` explicitly
+selects a place, while a parent such as `@home` includes memories assigned anywhere
+inside that branch. Place filtering uses manual assignments and never infers membership
+from nearby GPS coordinates.
 
 **Example:**
 ```bash
@@ -311,6 +317,8 @@ Ask a natural question about saved memories. Bepo retrieves the most relevant me
 **Request body (JSON):**
 - `message` (string, required): Your question or description (must not be empty or whitespace-only)
 - `top_k` (int, optional, default 3, min 1, max 10): Number of memories to retrieve
+- `place_id` (int, optional): Explicitly select a manual place branch
+- `detect_places` (boolean, optional, default `true`): Recognize saved place names in ordinary wording
 
 **Example:**
 ```bash

@@ -60,9 +60,14 @@ type Memory = {
 
 type PlacePathItem = { id: number; name: string };
 
-type Place = {
+type PlaceChoice = {
   id: number;
   name: string;
+  path: PlacePathItem[];
+  path_label: string;
+};
+
+type Place = PlaceChoice & {
   parent_id: number | null;
   lat: number | null;
   lon: number | null;
@@ -85,9 +90,17 @@ type MemoryFilters = {
   context_type?: MemoryContext;
   shopping_status?: ShoppingStatus;
   nearby?: boolean;
+  place?: PlaceChoice;
 };
 
-type ChatResponse = { status: string; answer: string; memories: Memory[]; filters?: MemoryFilters };
+type ChatResponse = {
+  status: string;
+  answer: string;
+  memories: Memory[];
+  filters?: MemoryFilters;
+  place_options?: PlaceChoice[];
+  suggested_place_name?: string;
+};
 type Requester = (path: string, options?: RequestInit) => Promise<any>;
 
 type ChatMessage = {
@@ -97,8 +110,12 @@ type ChatMessage = {
   photoUri?: string;
   tags?: string[];
   moods?: string[];
+  placeLabel?: string;
   memories?: Memory[];
   filters?: MemoryFilters;
+  placeOptions?: PlaceChoice[];
+  originalQuery?: string;
+  suggestedPlaceName?: string;
   meta?: string;
   error?: boolean;
 };
@@ -369,6 +386,43 @@ function activeHashtag(value: string) {
   };
 }
 
+function normalizePlaceTerm(value: string) {
+  return value
+    .trim()
+    .replace(/[-_]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .toLocaleLowerCase();
+}
+
+function activePlaceMention(value: string) {
+  const match = value.match(/(?:^|\s)@([\p{L}\p{N}_-]*)$/u);
+  if (!match) return null;
+  return {
+    query: normalizePlaceTerm(match[1]),
+    start: value.lastIndexOf('@'),
+  };
+}
+
+function detectImplicitPlace(value: string, places: Place[]): PlaceChoice | null {
+  if (!value.trim() || activePlaceMention(value)) return null;
+  const normalizedQuery = ` ${normalizePlaceTerm(value.replace(/[^\p{L}\p{N}_-]+/gu, ' '))} `;
+  const groups = new Map<string, Place[]>();
+  places.forEach((place) => {
+    const normalizedName = normalizePlaceTerm(place.name);
+    if (!normalizedName || !normalizedQuery.includes(` ${normalizedName} `)) return;
+    groups.set(normalizedName, [...(groups.get(normalizedName) || []), place]);
+  });
+  const rankedGroups = [...groups.entries()].sort((left, right) => {
+    const leftDepth = Math.max(...left[1].map((place) => place.path.length));
+    const rightDepth = Math.max(...right[1].map((place) => place.path.length));
+    return right[0].split(' ').length - left[0].split(' ').length
+      || right[0].length - left[0].length
+      || rightDepth - leftDepth;
+  });
+  if (!rankedGroups.length || rankedGroups[0][1].length !== 1) return null;
+  return rankedGroups[0][1][0];
+}
+
 function consumeCompletedHashtags(value: string) {
   const tags: string[] = [];
   const text = value.replace(/(^|\s)#([\p{L}\p{N}][\p{L}\p{N}_-]*)(?=\s)/gu, (_match, _leading, rawTag) => {
@@ -596,6 +650,7 @@ export default function BepoApp() {
           memoryCount={memories.length}
           knownTags={knownTagsFromMemories(memories)}
           knownMoods={knownMoodsFromMemories(memories)}
+          places={places}
           onMemorySaved={() => loadMemories(true)}
           onOpenMemories={() => setScreen('memories')}
           onOpenPlaces={() => setScreen('places')}
@@ -667,6 +722,7 @@ function ChatScreen({
   memoryCount,
   knownTags,
   knownMoods,
+  places,
   onMemorySaved,
   onOpenMemories,
   onOpenPlaces,
@@ -678,6 +734,7 @@ function ChatScreen({
   memoryCount: number;
   knownTags: string[];
   knownMoods: string[];
+  places: Place[];
   onMemorySaved: () => Promise<void>;
   onOpenMemories: () => void;
   onOpenPlaces: () => void;
@@ -688,6 +745,9 @@ function ChatScreen({
   const [pendingPhoto, setPendingPhoto] = useState<PendingPhoto | null>(null);
   const [selectedTags, setSelectedTags] = useState<string[]>([]);
   const [selectedMoods, setSelectedMoods] = useState<string[]>([]);
+  const [selectedPlace, setSelectedPlace] = useState<PlaceChoice | null>(null);
+  const [placeSelectionMode, setPlaceSelectionMode] = useState<'automatic' | 'manual' | null>(null);
+  const [ignoredAutomaticPlaceId, setIgnoredAutomaticPlaceId] = useState<number | null>(null);
   const [moodPickerOpen, setMoodPickerOpen] = useState(false);
   const [addingMood, setAddingMood] = useState(false);
   const [moodDraft, setMoodDraft] = useState('');
@@ -711,6 +771,17 @@ function ChatScreen({
   function handleDraftChange(value: string) {
     if (!pendingPhoto) {
       setDraft(value);
+      if (placeSelectionMode !== 'manual') {
+        const detected = detectImplicitPlace(value, places);
+        if (detected && detected.id !== ignoredAutomaticPlaceId) {
+          setSelectedPlace(detected);
+          setPlaceSelectionMode('automatic');
+        } else {
+          setSelectedPlace(null);
+          setPlaceSelectionMode(null);
+          if (!detected) setIgnoredAutomaticPlaceId(null);
+        }
+      }
       return;
     }
     const consumed = consumeCompletedHashtags(value);
@@ -731,6 +802,23 @@ function ChatScreen({
 
   function removeTag(tag: string) {
     setSelectedTags((current) => current.filter((item) => item !== tag));
+  }
+
+  function selectPlace(place: PlaceChoice) {
+    const active = activePlaceMention(draft);
+    if (active) setDraft(draft.slice(0, active.start).trimEnd());
+    setSelectedPlace(place);
+    setPlaceSelectionMode('manual');
+    setIgnoredAutomaticPlaceId(null);
+    requestAnimationFrame(() => inputRef.current?.focus());
+  }
+
+  function removeSelectedPlace() {
+    if (selectedPlace && placeSelectionMode === 'automatic') {
+      setIgnoredAutomaticPlaceId(selectedPlace.id);
+    }
+    setSelectedPlace(null);
+    setPlaceSelectionMode(null);
   }
 
   function toggleMood(mood: string) {
@@ -820,29 +908,36 @@ function ChatScreen({
     }
   }
 
-  async function sendMessage(textOverride?: string) {
+  async function sendMessage(textOverride?: string, placeOverride?: PlaceChoice) {
     const photo = pendingPhoto;
+    const place = placeOverride ?? selectedPlace;
     const rawText = (textOverride ?? draft).trim();
     const taggedNote = photo ? finalizeTaggedNote(rawText, selectedTags) : { note: rawText, tags: [] };
     const text = taggedNote.note;
+    const queryText = text || (place ? `Show me memories from ${place.name}` : '');
     const tags = taggedNote.tags;
     const moods = photo ? selectedMoods : [];
-    if (sending || photo?.metadataLoading || (!text && !photo)) return;
+    if (sending || photo?.metadataLoading || (!queryText && !photo)) return;
 
     const userId = messageId('user');
     addMessage({
       id: userId,
       role: 'user',
-      text: text || 'Remember this.',
+      text: text || (photo ? 'Remember this.' : queryText),
       photoUri: photo?.asset.uri,
       tags: tags.length ? tags : undefined,
       moods: moods.length ? moods : undefined,
+      placeLabel: place?.path_label,
       meta: photo ? 'Saving memory…' : undefined,
     });
     if (textOverride === undefined) setDraft('');
     setPendingPhoto(null);
     setSelectedTags([]);
     setSelectedMoods([]);
+    setSelectedPlace(null);
+    setPlaceSelectionMode(null);
+    const detectPlaces = ignoredAutomaticPlaceId === null;
+    setIgnoredAutomaticPlaceId(null);
     setMoodPickerOpen(false);
     setAddingMood(false);
     setMoodDraft('');
@@ -862,6 +957,7 @@ function ChatScreen({
         if (text) form.append('note', text);
         if (tags.length) form.append('tags', tags.join(','));
         if (moods.length) form.append('mood', moods.join(','));
+        if (place) form.append('place_id', String(place.id));
         if (photo.takenAt) {
           form.append('taken_at', photo.takenAt);
           form.append('taken_at_source', photo.takenAtSource || 'photo');
@@ -900,10 +996,12 @@ function ChatScreen({
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            message: text,
+            message: queryText,
             top_k: 5,
             lat: coordinates?.lat,
             lon: coordinates?.lon,
+            place_id: place?.id,
+            detect_places: detectPlaces,
           }),
         })) as ChatResponse;
         addMessage({
@@ -912,6 +1010,9 @@ function ChatScreen({
           text: response.answer,
           memories: response.memories || [],
           filters: response.filters,
+          placeOptions: response.place_options,
+          originalQuery: queryText,
+          suggestedPlaceName: response.suggested_place_name,
         });
       }
     } catch (error) {
@@ -927,8 +1028,9 @@ function ChatScreen({
     }
   }
 
-  const canSend = Boolean(draft.trim() || pendingPhoto) && !sending && !pendingPhoto?.metadataLoading;
+  const canSend = Boolean(draft.trim() || pendingPhoto || selectedPlace) && !sending && !pendingPhoto?.metadataLoading;
   const activeTag = activeHashtag(draft);
+  const activePlace = activePlaceMention(draft);
   const matchingTags = activeTag
     ? knownTags
       .filter((tag) => (!pendingPhoto || !selectedTags.includes(tag)) && (!activeTag.query || tag.startsWith(activeTag.query)))
@@ -941,6 +1043,20 @@ function ChatScreen({
     && !selectedTags.includes(activeTag.query)
     && !knownTags.includes(activeTag.query),
   );
+  const matchingPlaces = activePlace
+    ? places
+      .filter((place) => {
+        if (!activePlace.query) return true;
+        return normalizePlaceTerm(place.name).includes(activePlace.query)
+          || normalizePlaceTerm(place.path_label.replace(/›/g, ' ')).includes(activePlace.query);
+      })
+      .sort((left, right) => {
+        const leftStarts = normalizePlaceTerm(left.name).startsWith(activePlace.query) ? 0 : 1;
+        const rightStarts = normalizePlaceTerm(right.name).startsWith(activePlace.query) ? 0 : 1;
+        return leftStarts - rightStarts || left.path_label.localeCompare(right.path_label);
+      })
+      .slice(0, 8)
+    : [];
   const moodOptions = [...new Set([...knownMoods, ...STARTER_MOODS, ...selectedMoods])];
 
   return (
@@ -960,7 +1076,15 @@ function ChatScreen({
           ref={listRef}
           data={messages}
           keyExtractor={(item) => item.id}
-          renderItem={({ item }) => <ChatBubble message={item} apiUrl={apiUrl} apiKey={apiKey} />}
+          renderItem={({ item }) => (
+            <ChatBubble
+              message={item}
+              apiUrl={apiUrl}
+              apiKey={apiKey}
+              onChoosePlace={(place) => sendMessage(item.originalQuery, place)}
+              onOpenPlaces={onOpenPlaces}
+            />
+          )}
           keyboardShouldPersistTaps="handled"
           contentContainerStyle={[styles.chatListContent, messages.length === 0 && styles.chatListEmpty]}
           ListEmptyComponent={<EmptyConversation onPrompt={(prompt) => sendMessage(prompt)} />}
@@ -1122,6 +1246,47 @@ function ChatScreen({
               ))}
             </ScrollView>
           ) : null}
+          {selectedPlace ? (
+            <View style={styles.selectedPlaceRow}>
+              <Pressable
+                accessibilityLabel={`Remove place ${selectedPlace.path_label}`}
+                style={styles.selectedPlaceChip}
+                onPress={removeSelectedPlace}
+              >
+                <Ionicons name="location-outline" size={14} color="#4F6270" />
+                <Text style={styles.selectedPlaceText}>{selectedPlace.path_label}</Text>
+                <Ionicons name="close" size={13} color="#4F6270" />
+              </Pressable>
+            </View>
+          ) : null}
+          {activePlace ? (
+            <View style={styles.placeMentionSuggestions}>
+              {matchingPlaces.length ? (
+                <ScrollView
+                  horizontal
+                  showsHorizontalScrollIndicator={false}
+                  keyboardShouldPersistTaps="always"
+                  contentContainerStyle={styles.tagSuggestionRow}
+                >
+                  {matchingPlaces.map((place) => (
+                    <Pressable
+                      key={place.id}
+                      accessibilityLabel={`Use place ${place.path_label}`}
+                      style={styles.placeMentionChip}
+                      onPress={() => selectPlace(place)}
+                    >
+                      <Ionicons name="location-outline" size={14} color="#4F6270" />
+                      <Text style={styles.placeMentionText}>{place.path_label}</Text>
+                    </Pressable>
+                  ))}
+                </ScrollView>
+              ) : (
+                <Text style={styles.tagSuggestionHint}>
+                  {activePlace.query ? 'No saved place matches. Bepo can help you create it after searching.' : 'Create a place from the branching icon first.'}
+                </Text>
+              )}
+            </View>
+          ) : null}
           {activeTag ? (
             <View style={styles.tagSuggestions}>
               {matchingTags.length || canCreateTag ? (
@@ -1172,7 +1337,7 @@ function ChatScreen({
               value={draft}
               onChangeText={handleDraftChange}
               multiline
-              placeholder={pendingPhoto ? 'Add a note… use # for tags' : 'Message Bepo…'}
+              placeholder={pendingPhoto ? 'Add a note… #tag or @place' : 'Message Bepo… #tag or @place'}
               placeholderTextColor="#8B8B85"
             />
             <Pressable
@@ -1235,7 +1400,13 @@ function EmptyConversation({ onPrompt }: { onPrompt: (prompt: string) => void })
   );
 }
 
-function ChatBubble({ message, apiUrl, apiKey }: { message: ChatMessage; apiUrl: string; apiKey: string }) {
+function ChatBubble({ message, apiUrl, apiKey, onChoosePlace, onOpenPlaces }: {
+  message: ChatMessage;
+  apiUrl: string;
+  apiKey: string;
+  onChoosePlace: (place: PlaceChoice) => void;
+  onOpenPlaces: () => void;
+}) {
   if (message.role === 'user') {
     return (
       <View style={styles.userMessageRow}>
@@ -1250,6 +1421,11 @@ function ChatBubble({ message, apiUrl, apiKey }: { message: ChatMessage; apiUrl:
           {message.moods?.length ? (
             <View style={styles.userMoodRow}>
               {message.moods.map((mood) => <Text key={mood} style={styles.userMood}>{mood}</Text>)}
+            </View>
+          ) : null}
+          {message.placeLabel ? (
+            <View style={styles.userPlaceRow}>
+              <Text style={styles.userPlace}>⌖ {message.placeLabel}</Text>
             </View>
           ) : null}
           {message.meta ? <Text style={styles.userBubbleMeta}>{message.meta}</Text> : null}
@@ -1269,7 +1445,30 @@ function ChatBubble({ message, apiUrl, apiKey }: { message: ChatMessage; apiUrl:
             {message.filters.context_type ? <Text style={styles.assistantNeutralFilter}>{contextLabel(message.filters.context_type)}</Text> : null}
             {message.filters.shopping_status ? <Text style={styles.assistantStatusFilter}>{shoppingLabel(message.filters.shopping_status)}</Text> : null}
             {message.filters.nearby ? <Text style={styles.assistantNearbyFilter}>⌖ nearby</Text> : null}
+            {message.filters.place ? <Text style={styles.assistantPlaceFilter}>⌖ {message.filters.place.path_label}</Text> : null}
           </View>
+        ) : null}
+        {message.placeOptions?.length ? (
+          <View style={styles.placeOptionList}>
+            {message.placeOptions.map((place) => (
+              <Pressable
+                key={place.id}
+                accessibilityLabel={`Choose ${place.path_label}`}
+                style={styles.placeOptionButton}
+                onPress={() => onChoosePlace(place)}
+              >
+                <Ionicons name="location-outline" size={16} color="#4F6270" />
+                <Text style={styles.placeOptionText}>{place.path_label}</Text>
+                <Ionicons name="chevron-forward" size={15} color="#7B8982" />
+              </Pressable>
+            ))}
+          </View>
+        ) : null}
+        {message.suggestedPlaceName ? (
+          <Pressable style={styles.createPlaceSuggestion} onPress={onOpenPlaces}>
+            <Ionicons name="add" size={16} color="#4F6270" />
+            <Text style={styles.createPlaceSuggestionText}>Open Places to create “{message.suggestedPlaceName}”</Text>
+          </Pressable>
         ) : null}
         {message.memories?.map((memory) => (
           <MemoryCard key={memory.id} memory={memory} apiUrl={apiUrl} apiKey={apiKey} compact />
@@ -2173,3 +2372,4 @@ function PrimaryButton({ label, onPress, disabled = false }: { label: string; on
     </Pressable>
   );
 }
+

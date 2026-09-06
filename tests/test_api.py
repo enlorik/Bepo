@@ -954,6 +954,142 @@ class TestSearch:
 
 
 class TestChat:
+    def test_plain_place_name_filters_to_that_manual_place(self, client):
+        home_id = client.post("/places", json={"name": "Home"}).json()["id"]
+        bedroom_id = client.post(
+            "/places", json={"name": "Bedroom", "parent_id": home_id}
+        ).json()["id"]
+        kitchen_id = client.post(
+            "/places", json={"name": "Kitchen", "parent_id": home_id}
+        ).json()["id"]
+        bedroom_memory = client.post(
+            "/memory",
+            files={"photo": ("bed.jpg", _tiny_jpeg(), "image/jpeg")},
+            data={"note": "blue blanket", "place_id": str(bedroom_id)},
+        ).json()["memory_id"]
+        client.post(
+            "/memory",
+            files={"photo": ("tea.jpg", _tiny_jpeg(), "image/jpeg")},
+            data={"note": "tea shelf", "place_id": str(kitchen_id)},
+        )
+
+        data = client.post("/chat", json={"message": "show me memories from bedroom"}).json()
+
+        assert data["status"] == "success"
+        assert [memory["id"] for memory in data["memories"]] == [bedroom_memory]
+        assert data["filters"]["place"] == {
+            "id": bedroom_id,
+            "name": "Bedroom",
+            "path": [
+                {"id": home_id, "name": "Home"},
+                {"id": bedroom_id, "name": "Bedroom"},
+            ],
+            "path_label": "Home › Bedroom",
+        }
+        assert "Home › Bedroom" in data["answer"]
+
+    def test_user_can_remove_automatic_place_interpretation(self, client):
+        bedroom_id = client.post("/places", json={"name": "Bedroom"}).json()["id"]
+        client.post(
+            "/memory",
+            files={"photo": ("bed.jpg", _tiny_jpeg(), "image/jpeg")},
+            data={"note": "quiet bedroom", "place_id": str(bedroom_id)},
+        )
+
+        data = client.post(
+            "/chat",
+            json={"message": "bedroom", "detect_places": False},
+        ).json()
+
+        assert "place" not in data["filters"]
+
+    def test_parent_place_query_includes_nested_places_but_not_unassigned_gps(self, client):
+        home_id = client.post(
+            "/places", json={"name": "Home", "lat": 52.23, "lon": 21.01}
+        ).json()["id"]
+        bedroom_id = client.post(
+            "/places", json={"name": "Bedroom", "parent_id": home_id}
+        ).json()["id"]
+        home_memory = client.post(
+            "/memory",
+            files={"photo": ("home.jpg", _tiny_jpeg(), "image/jpeg")},
+            data={"place_id": str(home_id)},
+        ).json()["memory_id"]
+        bedroom_memory = client.post(
+            "/memory",
+            files={"photo": ("bed.jpg", _tiny_jpeg(), "image/jpeg")},
+            data={"place_id": str(bedroom_id)},
+        ).json()["memory_id"]
+        client.post(
+            "/memory",
+            files={"photo": ("gps-only.jpg", _tiny_jpeg(), "image/jpeg")},
+            data={"lat": "52.23", "lon": "21.01"},
+        )
+
+        data = client.post("/chat", json={"message": "@home"}).json()
+
+        assert data["status"] == "success"
+        assert {memory["id"] for memory in data["memories"]} == {home_memory, bedroom_memory}
+        assert all(memory["place_id"] is not None for memory in data["memories"])
+
+    def test_duplicate_place_name_returns_tappable_disambiguation_options(self, client):
+        home_id = client.post("/places", json={"name": "Home"}).json()["id"]
+        cabin_id = client.post("/places", json={"name": "Cabin"}).json()["id"]
+        home_bedroom = client.post(
+            "/places", json={"name": "Bedroom", "parent_id": home_id}
+        ).json()
+        cabin_bedroom = client.post(
+            "/places", json={"name": "Bedroom", "parent_id": cabin_id}
+        ).json()
+        client.post(
+            "/memory",
+            files={"photo": ("bed.jpg", _tiny_jpeg(), "image/jpeg")},
+            data={"place_id": str(home_bedroom["id"])},
+        )
+
+        data = client.post("/chat", json={"message": "show bedroom"}).json()
+
+        assert data["status"] == "needs_place"
+        assert [place["path_label"] for place in data["place_options"]] == [
+            "Cabin › Bedroom",
+            "Home › Bedroom",
+        ]
+        assert data["memories"] == []
+        assert "Which place" in data["answer"]
+
+        chosen = client.post(
+            "/chat",
+            json={"message": "show bedroom", "place_id": home_bedroom["id"]},
+        ).json()
+        assert chosen["status"] == "success"
+        assert chosen["filters"]["place"]["path_label"] == "Home › Bedroom"
+
+    def test_unknown_explicit_place_gently_suggests_creating_it(self, client):
+        client.post(
+            "/memory",
+            files={"photo": ("memory.jpg", _tiny_jpeg(), "image/jpeg")},
+        )
+
+        data = client.post("/chat", json={"message": "show me @secret-attic"}).json()
+
+        assert data["status"] == "no_results"
+        assert data["suggested_place_name"] == "secret attic"
+        assert data["memories"] == []
+        assert "want to create" in data["answer"]
+
+    def test_explicit_multiword_place_uses_hyphenated_mention(self, client):
+        cafe_id = client.post("/places", json={"name": "Cat Cafe"}).json()["id"]
+        memory_id = client.post(
+            "/memory",
+            files={"photo": ("cat.jpg", _tiny_jpeg(), "image/jpeg")},
+            data={"place_id": str(cafe_id)},
+        ).json()["memory_id"]
+
+        data = client.post("/chat", json={"message": "@cat-cafe"}).json()
+
+        assert data["status"] == "success"
+        assert [memory["id"] for memory in data["memories"]] == [memory_id]
+
     def test_no_results_on_empty_database(self, client):
         r = client.post("/chat", json={"message": "Where was the calm cafe?"})
         assert r.status_code == 200
