@@ -70,6 +70,9 @@ The lightweight hosted setup avoids downloading a large machine-learning model d
 - `BEPO_DB_PATH`: overrides the SQLite file path
 - `BEPO_IMAGES_DIR`: overrides the uploaded-image directory
 - `BEPO_ENABLE_CLIP`: set to `1` to enable CLIP when its optional dependencies are installed
+- `BEPO_CLIP_MIN_SIMILARITY`: minimum visual relevance score (default `0.24`)
+- `BEPO_CLIP_CLUSTER_MAX_GAP`: largest score drop allowed inside the best-match cluster (default `0.025`)
+- `BEPO_CLIP_CLUSTER_MAX_SPREAD`: farthest a clustered result may be from the best score (default `0.05`)
 - `HOST`: server bind address; defaults to `0.0.0.0`
 - `PORT`: server port; defaults to `8000`
 

@@ -668,6 +668,58 @@ class TestPlaces:
 
 
 class TestSearch:
+    def test_visual_search_keeps_the_cluster_nearest_the_best_score(self, monkeypatch):
+        monkeypatch.setattr(app_module, "CLIP_MIN_SIMILARITY", 0.24)
+        monkeypatch.setattr(app_module, "CLIP_CLUSTER_MAX_GAP", 0.025)
+        monkeypatch.setattr(app_module, "CLIP_CLUSTER_MAX_SPREAD", 0.05)
+        scored = [
+            {"id": 1, "_semantic_score": 0.36, "_lexical_score": 0.0},
+            {"id": 2, "_semantic_score": 0.34, "_lexical_score": 0.0},
+            {"id": 3, "_semantic_score": 0.32, "_lexical_score": 0.0},
+            {"id": 4, "_semantic_score": 0.23, "_lexical_score": 0.0},
+        ]
+
+        matches = app_module.keep_top_semantic_cluster(scored)
+
+        assert [match["id"] for match in matches] == [1, 2, 3]
+
+    def test_visual_search_stops_at_a_large_drop_from_the_best_match(self, monkeypatch):
+        monkeypatch.setattr(app_module, "CLIP_MIN_SIMILARITY", 0.24)
+        monkeypatch.setattr(app_module, "CLIP_CLUSTER_MAX_GAP", 0.025)
+        monkeypatch.setattr(app_module, "CLIP_CLUSTER_MAX_SPREAD", 0.05)
+        scored = [
+            {"id": 1, "_semantic_score": 0.36, "_lexical_score": 0.0},
+            {"id": 2, "_semantic_score": 0.25, "_lexical_score": 0.0},
+            {"id": 3, "_semantic_score": 0.23, "_lexical_score": 0.0},
+        ]
+
+        matches = app_module.keep_top_semantic_cluster(scored)
+
+        assert [match["id"] for match in matches] == [1]
+
+    def test_visual_search_rejects_an_entirely_weak_cluster(self, monkeypatch):
+        monkeypatch.setattr(app_module, "CLIP_MIN_SIMILARITY", 0.24)
+        scored = [
+            {"id": 1, "_semantic_score": 0.23, "_lexical_score": 0.0},
+            {"id": 2, "_semantic_score": 0.22, "_lexical_score": 0.0},
+        ]
+
+        assert app_module.keep_top_semantic_cluster(scored) == []
+
+    def test_direct_text_match_survives_outside_visual_cluster(self, monkeypatch):
+        monkeypatch.setattr(app_module, "CLIP_MIN_SIMILARITY", 0.24)
+        monkeypatch.setattr(app_module, "CLIP_CLUSTER_MAX_GAP", 0.025)
+        monkeypatch.setattr(app_module, "CLIP_CLUSTER_MAX_SPREAD", 0.05)
+        scored = [
+            {"id": 1, "_semantic_score": 0.36, "_lexical_score": 0.0},
+            {"id": 2, "_semantic_score": 0.20, "_lexical_score": 1.0},
+            {"id": 3, "_semantic_score": 0.19, "_lexical_score": 0.0},
+        ]
+
+        matches = app_module.keep_top_semantic_cluster(scored)
+
+        assert [match["id"] for match in matches] == [1, 2]
+
     def test_refreshes_old_embeddings_for_the_active_model(self, client):
         memory_id = client.post(
             "/memory",
@@ -1114,3 +1166,4 @@ class TestInitDbMigration:
             assert cursor2.fetchone() is not None
         finally:
             conn2.close()
+

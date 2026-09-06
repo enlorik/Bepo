@@ -43,7 +43,9 @@ def env_flag(name: str, default: bool = False) -> bool:
 # CLIP is opt-in so small hosted deployments can start quickly and reliably.
 # Install requirements-clip.txt and set BEPO_ENABLE_CLIP=1 to enable it.
 USE_CLIP = env_flag("BEPO_ENABLE_CLIP")
-CLIP_MIN_SIMILARITY = float(os.getenv("BEPO_CLIP_MIN_SIMILARITY", "0.22"))
+CLIP_MIN_SIMILARITY = float(os.getenv("BEPO_CLIP_MIN_SIMILARITY", "0.24"))
+CLIP_CLUSTER_MAX_GAP = float(os.getenv("BEPO_CLIP_CLUSTER_MAX_GAP", "0.025"))
+CLIP_CLUSTER_MAX_SPREAD = float(os.getenv("BEPO_CLIP_CLUSTER_MAX_SPREAD", "0.05"))
 model = None
 processor = None
 
@@ -928,6 +930,43 @@ def lexical_relevance(query: str, row: sqlite3.Row) -> float:
     return len(query_tokens & searchable_tokens) / len(query_tokens)
 
 
+def keep_top_semantic_cluster(scored: list[dict]) -> list[dict]:
+    """Keep direct text matches plus the strong semantic cluster nearest the best score.
+
+    CLIP cosine scores are rankings rather than calibrated probabilities. A fixed
+    floor rejects weak results, while the gap/spread rules avoid returning every
+    photo merely because each one barely cleared that floor.
+    """
+    semantic_candidates = sorted(
+        (
+            item
+            for item in scored
+            if item["_semantic_score"] >= CLIP_MIN_SIMILARITY
+        ),
+        key=lambda item: item["_semantic_score"],
+        reverse=True,
+    )
+
+    selected_ids = set()
+    if semantic_candidates:
+        best_score = semantic_candidates[0]["_semantic_score"]
+        previous_score = best_score
+        for item in semantic_candidates:
+            score = item["_semantic_score"]
+            if best_score - score > CLIP_CLUSTER_MAX_SPREAD:
+                break
+            if selected_ids and previous_score - score > CLIP_CLUSTER_MAX_GAP:
+                break
+            selected_ids.add(item["id"])
+            previous_score = score
+
+    return [
+        item
+        for item in scored
+        if item["_lexical_score"] > 0 or item["id"] in selected_ids
+    ]
+
+
 def haversine_distance_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     """Return the great-circle distance between two coordinates in kilometers."""
     earth_radius_km = 6371.0088
@@ -1022,7 +1061,8 @@ def search_memory_matches_with_filters(
                 text_score = -1.0
 
         lexical_score = lexical_relevance(semantic_query, row) if semantic_query else 0.0
-        score = max(image_score, text_score, lexical_score)
+        semantic_score = max(image_score, text_score)
+        score = max(semantic_score, lexical_score)
         memory_id = row["id"]
         lat = row["lat"]
         lon = row["lon"]
@@ -1055,15 +1095,13 @@ def search_memory_matches_with_filters(
             "map_url": build_map_url(lat, lon),
             "distance_km": distance_km,
             "score": score,
+            "_semantic_score": semantic_score,
             "_lexical_score": lexical_score,
         })
 
     if semantic_query:
         if clip_ready:
-            scored = [
-                item for item in scored
-                if item["_lexical_score"] > 0 or item["score"] >= CLIP_MIN_SIMILARITY
-            ]
+            scored = keep_top_semantic_cluster(scored)
         else:
             scored = [item for item in scored if item["_lexical_score"] > 0]
 
@@ -1076,6 +1114,7 @@ def search_memory_matches_with_filters(
     matches = scored[:top_k]
     for item in matches:
         item.pop("_lexical_score", None)
+        item.pop("_semantic_score", None)
     return matches, filters, False
 
 
@@ -1738,3 +1777,4 @@ if __name__ == "__main__":
         host=os.getenv("HOST", "0.0.0.0"),
         port=int(os.getenv("PORT", "8000")),
     )
+
