@@ -108,6 +108,7 @@ type ChatMessage = {
   role: 'user' | 'assistant';
   text: string;
   photoUri?: string;
+  memoryId?: number;
   tags?: string[];
   moods?: string[];
   placeLabel?: string;
@@ -454,7 +455,7 @@ export default function BepoApp() {
   const [screen, setScreen] = useState<Screen>('chat');
   const [selectedMemoryId, setSelectedMemoryId] = useState<number | null>(null);
   const [selectedPlaceId, setSelectedPlaceId] = useState<number | null>(null);
-  const [memoryReturnScreen, setMemoryReturnScreen] = useState<'memories' | 'places'>('memories');
+  const [memoryReturnScreen, setMemoryReturnScreen] = useState<'chat' | 'memories' | 'places'>('memories');
   const [apiUrl, setApiUrl] = useState(DEFAULT_API_URL);
   const [apiKey, setApiKey] = useState('');
   const [draftUrl, setDraftUrl] = useState(DEFAULT_API_URL);
@@ -590,7 +591,7 @@ export default function BepoApp() {
     }
   }
 
-  function openMemory(memoryId: number, returnScreen: 'memories' | 'places' = 'memories') {
+  function openMemory(memoryId: number, returnScreen: 'chat' | 'memories' | 'places' = 'memories') {
     setSelectedMemoryId(memoryId);
     setMemoryReturnScreen(returnScreen);
     setScreen('memory');
@@ -655,6 +656,7 @@ export default function BepoApp() {
           onOpenMemories={() => setScreen('memories')}
           onOpenPlaces={() => setScreen('places')}
           onOpenSettings={() => setScreen('settings')}
+          onOpenMemory={(memoryId) => openMemory(memoryId, 'chat')}
         />
       ) : null}
       {screen === 'memories' ? (
@@ -727,6 +729,7 @@ function ChatScreen({
   onOpenMemories,
   onOpenPlaces,
   onOpenSettings,
+  onOpenMemory,
 }: {
   request: Requester;
   apiUrl: string;
@@ -739,6 +742,7 @@ function ChatScreen({
   onOpenMemories: () => void;
   onOpenPlaces: () => void;
   onOpenSettings: () => void;
+  onOpenMemory: (memoryId: number) => void;
 }) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [draft, setDraft] = useState('');
@@ -967,8 +971,9 @@ function ChatScreen({
           form.append('lon', String(coordinates.lon));
           if (locationSource) form.append('location_source', locationSource);
         }
-        await request('/memory', { method: 'POST', body: form });
+        const createdMemory = await request('/memory', { method: 'POST', body: form });
         updateMessage(userId, {
+          memoryId: createdMemory.memory_id,
           meta: photo.source === 'library'
             ? `Saved${photo.takenAt ? ' with original date' : ''}${coordinates ? ' and location' : ''}`
             : coordinates ? 'Saved with location' : 'Saved',
@@ -1083,6 +1088,7 @@ function ChatScreen({
               apiKey={apiKey}
               onChoosePlace={(place) => sendMessage(item.originalQuery, place)}
               onOpenPlaces={onOpenPlaces}
+              onOpenMemory={onOpenMemory}
             />
           )}
           keyboardShouldPersistTaps="handled"
@@ -1400,18 +1406,29 @@ function EmptyConversation({ onPrompt }: { onPrompt: (prompt: string) => void })
   );
 }
 
-function ChatBubble({ message, apiUrl, apiKey, onChoosePlace, onOpenPlaces }: {
+function ChatBubble({ message, apiUrl, apiKey, onChoosePlace, onOpenPlaces, onOpenMemory }: {
   message: ChatMessage;
   apiUrl: string;
   apiKey: string;
   onChoosePlace: (place: PlaceChoice) => void;
   onOpenPlaces: () => void;
+  onOpenMemory: (memoryId: number) => void;
 }) {
   if (message.role === 'user') {
     return (
       <View style={styles.userMessageRow}>
         <View style={styles.userBubble}>
-          {message.photoUri ? <Image source={{ uri: message.photoUri }} style={styles.userPhoto} /> : null}
+          {message.photoUri ? (
+            <Pressable
+              disabled={!message.memoryId}
+              accessibilityRole={message.memoryId ? 'button' : undefined}
+              accessibilityLabel={message.memoryId ? 'Open and edit this memory' : undefined}
+              onPress={() => message.memoryId && onOpenMemory(message.memoryId)}
+              style={({ pressed }) => pressed && styles.memoryCardPressed}
+            >
+              <Image source={{ uri: message.photoUri }} style={styles.userPhoto} />
+            </Pressable>
+          ) : null}
           <Text style={styles.userBubbleText}>{message.text}</Text>
           {message.tags?.length ? (
             <View style={styles.userTagRow}>
@@ -1482,7 +1499,14 @@ function ChatBubble({ message, apiUrl, apiKey, onChoosePlace, onOpenPlaces }: {
               contentContainerStyle={styles.memoryCarousel}
             >
               {message.memories.map((memory) => (
-                <MemoryCard key={memory.id} memory={memory} apiUrl={apiUrl} apiKey={apiKey} compact />
+                <MemoryCard
+                  key={memory.id}
+                  memory={memory}
+                  apiUrl={apiUrl}
+                  apiKey={apiKey}
+                  compact
+                  onPress={() => onOpenMemory(memory.id)}
+                />
               ))}
             </ScrollView>
             {message.memories.length > 1 ? (
@@ -2389,4 +2413,3 @@ function PrimaryButton({ label, onPress, disabled = false }: { label: string; on
     </Pressable>
   );
 }
-
