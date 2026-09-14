@@ -6,6 +6,7 @@ import { Asset as MediaLibraryAsset } from 'expo-media-library';
 import * as SecureStore from 'expo-secure-store';
 import { StatusBar } from 'expo-status-bar';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
+import MapView, { Marker, Region } from 'react-native-maps';
 import {
   ActivityIndicator,
   Alert,
@@ -79,6 +80,7 @@ type Place = PlaceChoice & {
   direct_memory_count: number;
   memory_count: number;
   child_count: number;
+  preview_memory_ids?: number[];
   distance_m?: number;
 };
 
@@ -1570,6 +1572,94 @@ function MemoriesScreen({ memories, apiUrl, apiKey, loading, refreshing, onRefre
   );
 }
 
+const CROATIA_REGION: Region = {
+  latitude: 45.15,
+  longitude: 15.45,
+  latitudeDelta: 5.8,
+  longitudeDelta: 6.4,
+};
+
+const BEIGE_MAP_STYLE = [
+  { elementType: 'geometry', stylers: [{ color: '#EDE4D4' }] },
+  { elementType: 'labels.text.fill', stylers: [{ color: '#756C60' }] },
+  { elementType: 'labels.text.stroke', stylers: [{ color: '#F7F0E5' }] },
+  { featureType: 'administrative', elementType: 'geometry.stroke', stylers: [{ color: '#C9BBA7' }] },
+  { featureType: 'landscape.natural', elementType: 'geometry', stylers: [{ color: '#E9DFC9' }] },
+  { featureType: 'poi', elementType: 'geometry', stylers: [{ color: '#E3D8C2' }] },
+  { featureType: 'poi', elementType: 'labels.icon', stylers: [{ visibility: 'off' }] },
+  { featureType: 'road', elementType: 'geometry', stylers: [{ color: '#F6EFE4' }] },
+  { featureType: 'road', elementType: 'geometry.stroke', stylers: [{ color: '#D8CCBA' }] },
+  { featureType: 'transit', elementType: 'labels.icon', stylers: [{ visibility: 'off' }] },
+  { featureType: 'water', elementType: 'geometry', stylers: [{ color: '#B9CDD0' }] },
+  { featureType: 'water', elementType: 'labels.text.fill', stylers: [{ color: '#637B7D' }] },
+];
+
+function placeMapCoordinate(place: Place, siblings: Place[]) {
+  const latitude = place.effective_lat ?? CROATIA_REGION.latitude;
+  const longitude = place.effective_lon ?? CROATIA_REGION.longitude;
+  const overlapping = siblings.filter((candidate) => (
+    candidate.effective_lat === place.effective_lat && candidate.effective_lon === place.effective_lon
+  ));
+  if (overlapping.length < 2) return { latitude, longitude };
+  const position = overlapping.findIndex((candidate) => candidate.id === place.id);
+  const angle = (Math.PI * 2 * position) / overlapping.length;
+  const radius = 0.00016 + Math.max(0, overlapping.length - 4) * 0.000025;
+  return {
+    latitude: latitude + Math.cos(angle) * radius,
+    longitude: longitude + Math.sin(angle) * radius,
+  };
+}
+
+function PlaceViewToggle({ mode, onChange }: { mode: 'map' | 'list'; onChange: (mode: 'map' | 'list') => void }) {
+  return (
+    <View style={styles.placeViewToggle}>
+      <Pressable onPress={() => onChange('map')} style={[styles.placeViewChoice, mode === 'map' && styles.placeViewChoiceSelected]}>
+        <Ionicons name="map-outline" size={14} color={mode === 'map' ? '#FFFFFF' : '#6F675E'} />
+        <Text style={[styles.placeViewChoiceText, mode === 'map' && styles.placeViewChoiceTextSelected]}>Map</Text>
+      </Pressable>
+      <Pressable onPress={() => onChange('list')} style={[styles.placeViewChoice, mode === 'list' && styles.placeViewChoiceSelected]}>
+        <Ionicons name="git-branch-outline" size={14} color={mode === 'list' ? '#FFFFFF' : '#6F675E'} />
+        <Text style={[styles.placeViewChoiceText, mode === 'list' && styles.placeViewChoiceTextSelected]}>Tree</Text>
+      </Pressable>
+    </View>
+  );
+}
+
+function PlaceMapPin({ place, coordinate, apiUrl, apiKey, onPress }: {
+  place: Place;
+  coordinate: { latitude: number; longitude: number };
+  apiUrl: string;
+  apiKey: string;
+  onPress: () => void;
+}) {
+  const previews = (place.preview_memory_ids || []).slice(0, 3);
+  return (
+    <Marker coordinate={coordinate} anchor={{ x: 0.5, y: 1 }} onPress={onPress} tracksViewChanges>
+      <View style={styles.mapPinWrap}>
+        {previews.length ? (
+          <View style={styles.mapPinPhotos}>
+            {previews.map((memoryId, index) => (
+              <Image
+                key={memoryId}
+                source={{ uri: absoluteUrl(apiUrl, `/image/${memoryId}`), headers: { 'X-API-Key': apiKey } }}
+                style={[styles.mapPinPhoto, index > 0 && styles.mapPinPhotoOverlap]}
+              />
+            ))}
+          </View>
+        ) : null}
+        <View style={styles.mapPinLabel}>
+          <Text style={styles.mapPinLabelText} numberOfLines={1}>{place.name}</Text>
+          {place.memory_count ? <Text style={styles.mapPinCount}>{place.memory_count}</Text> : null}
+        </View>
+        <View style={styles.mapPinStem}>
+          <Ionicons name={place.child_count ? 'sparkles' : 'location'} size={15} color="#FFFDF8" />
+        </View>
+        <View style={styles.mapPinPoint} />
+      </View>
+    </Marker>
+  );
+}
+
 function PlacesScreen({ places, loading, selectedPlaceId, setSelectedPlaceId, request, apiUrl, apiKey, onReload, onOpenMemory, onBack }: {
   places: Place[];
   loading: boolean;
@@ -1586,6 +1676,9 @@ function PlacesScreen({ places, loading, selectedPlaceId, setSelectedPlaceId, re
   const [detailLoading, setDetailLoading] = useState(false);
   const [detailError, setDetailError] = useState('');
   const [editing, setEditing] = useState<{ place: Place | null; parentId: number | null } | null>(null);
+  const [viewMode, setViewMode] = useState<'map' | 'list'>('map');
+  const [mapReady, setMapReady] = useState(false);
+  const mapRef = useRef<MapView | null>(null);
 
   const loadDetail = useCallback(async (placeId: number) => {
     setDetailLoading(true);
@@ -1603,6 +1696,42 @@ function PlacesScreen({ places, loading, selectedPlaceId, setSelectedPlaceId, re
     if (selectedPlaceId !== null) loadDetail(selectedPlaceId);
     else setDetail(null);
   }, [loadDetail, selectedPlaceId]);
+
+  const currentPlace = selectedPlaceId === null
+    ? null
+    : detail || places.find((place) => place.id === selectedPlaceId) || null;
+  const mapPlaces = places.filter((place) => place.parent_id === selectedPlaceId);
+  const pinnedMapPlaces = mapPlaces.filter((place) => (
+    place.effective_lat !== null && place.effective_lon !== null
+  ));
+
+  useEffect(() => {
+    if (!mapReady || viewMode !== 'map' || !mapRef.current) return undefined;
+    const coordinates = pinnedMapPlaces.map((place) => placeMapCoordinate(place, pinnedMapPlaces));
+    const focus = currentPlace?.effective_lat !== null && currentPlace?.effective_lat !== undefined
+      && currentPlace.effective_lon !== null && currentPlace.effective_lon !== undefined
+      ? { latitude: currentPlace.effective_lat, longitude: currentPlace.effective_lon }
+      : null;
+    const timer = setTimeout(() => {
+      if (!mapRef.current) return;
+      if (coordinates.length > 1) {
+        mapRef.current.fitToCoordinates(coordinates, {
+          edgePadding: { top: 150, right: 72, bottom: 255, left: 72 },
+          animated: true,
+        });
+      } else if (coordinates.length === 1 || focus) {
+        const target = coordinates[0] || focus!;
+        mapRef.current.animateToRegion({
+          ...target,
+          latitudeDelta: selectedPlaceId === null ? 0.32 : 0.008,
+          longitudeDelta: selectedPlaceId === null ? 0.32 : 0.008,
+        }, 650);
+      } else if (selectedPlaceId === null) {
+        mapRef.current.animateToRegion(CROATIA_REGION, 650);
+      }
+    }, 180);
+    return () => clearTimeout(timer);
+  }, [currentPlace, mapReady, pinnedMapPlaces, selectedPlaceId, viewMode]);
 
   async function handlePlaceSaved(place: Place) {
     await onReload();
@@ -1624,6 +1753,118 @@ function PlacesScreen({ places, loading, selectedPlaceId, setSelectedPlaceId, re
     );
   }
 
+  if (viewMode === 'map') {
+    const mapBack = () => {
+      if (currentPlace) setSelectedPlaceId(currentPlace.parent_id);
+      else onBack();
+    };
+    const pathLabel = currentPlace?.path_label || 'Your world';
+    const hiddenFolders = mapPlaces.length - pinnedMapPlaces.length;
+    return (
+      <View style={styles.placeMapPage}>
+        <MapView
+          ref={mapRef}
+          style={styles.placeMap}
+          initialRegion={CROATIA_REGION}
+          mapType={Platform.OS === 'ios' ? 'mutedStandard' : 'standard'}
+          customMapStyle={BEIGE_MAP_STYLE}
+          showsBuildings={false}
+          showsCompass={false}
+          showsIndoors={false}
+          showsPointsOfInterests={false}
+          toolbarEnabled={false}
+          loadingEnabled
+          loadingBackgroundColor="#EDE4D4"
+          loadingIndicatorColor="#765D45"
+          onMapReady={() => setMapReady(true)}
+        >
+          {pinnedMapPlaces.map((place) => (
+            <PlaceMapPin
+              key={place.id}
+              place={place}
+              coordinate={placeMapCoordinate(place, pinnedMapPlaces)}
+              apiUrl={apiUrl}
+              apiKey={apiKey}
+              onPress={() => setSelectedPlaceId(place.id)}
+            />
+          ))}
+        </MapView>
+
+        <View style={styles.mapTopBar} pointerEvents="box-none">
+          <Pressable style={styles.mapRoundButton} onPress={mapBack}>
+            <Ionicons name="chevron-back" size={21} color="#413A33" />
+          </Pressable>
+          <View style={styles.mapBreadcrumb}>
+            <Text style={styles.mapBreadcrumbEyebrow}>{currentPlace ? 'INSIDE' : 'BEPO MAP'}</Text>
+            <Text style={styles.mapBreadcrumbText} numberOfLines={1}>{pathLabel}</Text>
+          </View>
+          <PlaceViewToggle mode={viewMode} onChange={setViewMode} />
+        </View>
+
+        <View style={styles.mapBottomArea} pointerEvents="box-none">
+          {detailError ? <Text style={styles.mapError}>{detailError}</Text> : null}
+          {currentPlace ? (
+            <View style={styles.mapPlaceCard}>
+              <View style={styles.mapPlaceCardHeading}>
+                <View style={styles.mapPlaceCardCopy}>
+                  <Text style={styles.mapPlaceCardTitle}>{currentPlace.name}</Text>
+                  <Text style={styles.mapPlaceCardMeta}>
+                    {currentPlace.child_count} inside · {currentPlace.memory_count} memories
+                  </Text>
+                </View>
+                {detailLoading ? <ActivityIndicator size="small" color="#765D45" /> : (
+                  <Pressable style={styles.mapTinyEdit} onPress={() => setEditing({ place: currentPlace, parentId: currentPlace.parent_id })}>
+                    <Ionicons name="pencil-outline" size={16} color="#655A50" />
+                  </Pressable>
+                )}
+              </View>
+              {(currentPlace.preview_memory_ids || []).length ? (
+                <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.mapPhotoRoll}>
+                  {(currentPlace.preview_memory_ids || []).map((memoryId) => (
+                    <Pressable key={memoryId} onPress={() => onOpenMemory(memoryId)}>
+                      <Image
+                        source={{ uri: absoluteUrl(apiUrl, `/image/${memoryId}`), headers: { 'X-API-Key': apiKey } }}
+                        style={styles.mapRollPhoto}
+                      />
+                    </Pressable>
+                  ))}
+                </ScrollView>
+              ) : null}
+              <View style={styles.mapPlaceActions}>
+                <Pressable style={styles.mapAddInsideButton} onPress={() => setEditing({ place: null, parentId: currentPlace.id })}>
+                  <Ionicons name="add" size={17} color="#FFFFFF" />
+                  <Text style={styles.mapAddInsideText}>Add inside</Text>
+                </Pressable>
+                <Pressable style={styles.mapOpenPlaceButton} onPress={() => setViewMode('list')}>
+                  <Text style={styles.mapOpenPlaceText}>See everything</Text>
+                  <Ionicons name="arrow-forward" size={16} color="#655A50" />
+                </Pressable>
+              </View>
+              {!pinnedMapPlaces.length && currentPlace.child_count ? (
+                <Text style={styles.mapGentleHint}>These smaller places need this place’s pin, or their own pin, before they can bloom on the map.</Text>
+              ) : null}
+            </View>
+          ) : (
+            <View style={styles.mapWelcomeCard}>
+              <View style={styles.mapWelcomeCopy}>
+                <Text style={styles.mapWelcomeTitle}>{loading ? 'Finding your places…' : 'Your little world'}</Text>
+                <Text style={styles.mapWelcomeText}>
+                  {pinnedMapPlaces.length
+                    ? 'Tap a pin to wander inside it.'
+                    : 'Create a place with a pin and it will appear here.'}
+                </Text>
+                {hiddenFolders > 0 ? <Text style={styles.mapWelcomeNote}>{hiddenFolders} folder{hiddenFolders === 1 ? '' : 's'} waiting for a map pin</Text> : null}
+              </View>
+              <Pressable style={styles.mapCreateButton} onPress={() => setEditing({ place: null, parentId: null })}>
+                <Ionicons name="add" size={23} color="#FFFFFF" />
+              </Pressable>
+            </View>
+          )}
+        </View>
+      </View>
+    );
+  }
+
   if (selectedPlaceId !== null) {
     const current = detail || places.find((place) => place.id === selectedPlaceId) || null;
     const parentId = current?.parent_id ?? null;
@@ -1635,6 +1876,7 @@ function PlacesScreen({ places, loading, selectedPlaceId, setSelectedPlaceId, re
           onBack={() => setSelectedPlaceId(parentId)}
         />
         <ScrollView contentContainerStyle={styles.placeDetailContent} showsVerticalScrollIndicator={false}>
+          <PlaceViewToggle mode={viewMode} onChange={setViewMode} />
           {detailLoading && !detail ? <ActivityIndicator color="#262624" style={styles.placeLoader} /> : null}
           {detailError ? <Text style={styles.editorError}>{detailError}</Text> : null}
           {current ? (
@@ -1710,6 +1952,7 @@ function PlacesScreen({ places, loading, selectedPlaceId, setSelectedPlaceId, re
     <View style={styles.fill}>
       <PageHeader title="Places" subtitle="Your memory forest" onBack={onBack} />
       <ScrollView contentContainerStyle={styles.placesContent} showsVerticalScrollIndicator={false}>
+        <PlaceViewToggle mode={viewMode} onChange={setViewMode} />
         <View style={styles.forestIntro}>
           <View style={styles.forestIllustration}>
             <Ionicons name="git-branch" size={28} color="#4F6B5B" />

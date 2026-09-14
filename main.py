@@ -509,6 +509,18 @@ def place_to_response(conn: sqlite3.Connection, row: sqlite3.Row) -> dict:
     child_count = conn.execute(
         "SELECT COUNT(*) FROM places WHERE parent_id = ?", (row["id"],)
     ).fetchone()[0]
+    preview_memory_ids = [
+        memory["id"]
+        for memory in conn.execute(
+            f"""
+            SELECT id FROM memories
+            WHERE place_id IN ({placeholders})
+            ORDER BY COALESCE(taken_at, ts) DESC
+            LIMIT 3
+            """,
+            descendant_ids,
+        ).fetchall()
+    ]
     return {
         "id": row["id"],
         "name": row["name"],
@@ -523,6 +535,7 @@ def place_to_response(conn: sqlite3.Connection, row: sqlite3.Row) -> dict:
         "direct_memory_count": direct_memory_count,
         "memory_count": descendant_memory_count,
         "child_count": child_count,
+        "preview_memory_ids": preview_memory_ids,
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
@@ -1979,4 +1992,3 @@ if __name__ == "__main__":
         host=os.getenv("HOST", "0.0.0.0"),
         port=int(os.getenv("PORT", "8000")),
     )
-

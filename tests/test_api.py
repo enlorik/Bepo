@@ -622,6 +622,8 @@ class TestPlaces:
         assert [memory["id"] for memory in home["memories"]] == [memory_id]
         assert home["memory_count"] == 1
         assert home["direct_memory_count"] == 0
+        assert home["preview_memory_ids"] == [memory_id]
+        assert kitchen["preview_memory_ids"] == [memory_id]
 
     def test_nearby_suggestions_only_return_existing_explicit_pins(self, client):
         cafe_id = client.post(
@@ -1302,4 +1304,3 @@ class TestInitDbMigration:
             assert cursor2.fetchone() is not None
         finally:
             conn2.close()
-
