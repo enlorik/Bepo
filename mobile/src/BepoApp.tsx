@@ -75,6 +75,7 @@ type Place = PlaceChoice & {
   effective_lat: number | null;
   effective_lon: number | null;
   pin_inherited: boolean;
+  pin_source?: 'own' | 'inherited' | 'memory' | null;
   path: PlacePathItem[];
   path_label: string;
   direct_memory_count: number;
@@ -1700,7 +1701,16 @@ function PlacesScreen({ places, loading, selectedPlaceId, setSelectedPlaceId, re
   const currentPlace = selectedPlaceId === null
     ? null
     : detail || places.find((place) => place.id === selectedPlaceId) || null;
-  const mapPlaces = places.filter((place) => place.parent_id === selectedPlaceId);
+  const placesInside = places.filter((place) => place.parent_id === selectedPlaceId);
+  // The world view shows every independently positioned place, including
+  // older folders positioned by an assigned memory's GPS. Once inside a
+  // place, the map returns to showing just that place's immediate children.
+  const mapPlaces = selectedPlaceId === null
+    ? places.filter((place) => (
+      place.effective_lat !== null && place.effective_lon !== null
+      && !place.pin_inherited
+    ))
+    : placesInside;
   const pinnedMapPlaces = mapPlaces.filter((place) => (
     place.effective_lat !== null && place.effective_lon !== null
   ));
@@ -1759,7 +1769,9 @@ function PlacesScreen({ places, loading, selectedPlaceId, setSelectedPlaceId, re
       else onBack();
     };
     const pathLabel = currentPlace?.path_label || 'Your world';
-    const hiddenFolders = mapPlaces.length - pinnedMapPlaces.length;
+    const hiddenFolders = selectedPlaceId === null
+      ? placesInside.filter((place) => place.effective_lat === null || place.effective_lon === null).length
+      : mapPlaces.length - pinnedMapPlaces.length;
     return (
       <View style={styles.placeMapPage}>
         <MapView
@@ -1886,7 +1898,9 @@ function PlacesScreen({ places, loading, selectedPlaceId, setSelectedPlaceId, re
                 <View style={styles.placeHeroCopy}>
                   <Text style={styles.placeHeroTitle}>{current.path_label}</Text>
                   <Text style={styles.placeHeroMeta}>
-                    {current.lat !== null
+                    {current.pin_source === 'memory'
+                      ? current.pin_inherited ? 'Uses a parent memory’s GPS' : 'Placed from a saved memory’s GPS'
+                      : current.lat !== null
                       ? 'Has its own map pin'
                       : current.pin_inherited
                         ? 'Uses its parent’s map pin'

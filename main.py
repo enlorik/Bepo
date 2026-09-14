@@ -497,6 +497,35 @@ def place_to_response(conn: sqlite3.Connection, row: sqlite3.Row) -> dict:
         (item for item in reversed(path_rows) if item["lat"] is not None and item["lon"] is not None),
         None,
     )
+    memory_pin_row = None
+    memory_pin_place_id = None
+    if effective_row is None:
+        # Older/manual folders may not have their own pin even though memories
+        # saved in that place do. Use the nearest place memory as a reversible
+        # map position instead of silently writing GPS onto the folder.
+        for item in reversed(path_rows):
+            memory_pin_row = conn.execute(
+                """
+                SELECT place_id, lat, lon FROM memories
+                WHERE place_id = ? AND lat IS NOT NULL AND lon IS NOT NULL
+                  AND COALESCE(context_type, 'physical') != 'online'
+                ORDER BY COALESCE(taken_at, ts) DESC
+                LIMIT 1
+                """,
+                (item["id"],),
+            ).fetchone()
+            if memory_pin_row is not None:
+                memory_pin_place_id = item["id"]
+                break
+    effective_lat = effective_row["lat"] if effective_row else (memory_pin_row["lat"] if memory_pin_row else None)
+    effective_lon = effective_row["lon"] if effective_row else (memory_pin_row["lon"] if memory_pin_row else None)
+    effective_place_id = effective_row["id"] if effective_row else memory_pin_place_id
+    pin_source = (
+        "own" if effective_row is not None and effective_row["id"] == row["id"]
+        else "inherited" if effective_row is not None
+        else "memory" if memory_pin_row is not None
+        else None
+    )
     descendant_ids = place_descendant_ids(conn, row["id"])
     placeholders = ",".join("?" for _ in descendant_ids)
     descendant_memory_count = conn.execute(
@@ -527,9 +556,10 @@ def place_to_response(conn: sqlite3.Connection, row: sqlite3.Row) -> dict:
         "parent_id": row["parent_id"],
         "lat": row["lat"],
         "lon": row["lon"],
-        "effective_lat": effective_row["lat"] if effective_row else None,
-        "effective_lon": effective_row["lon"] if effective_row else None,
-        "pin_inherited": effective_row is not None and effective_row["id"] != row["id"],
+        "effective_lat": effective_lat,
+        "effective_lon": effective_lon,
+        "pin_inherited": effective_place_id is not None and effective_place_id != row["id"],
+        "pin_source": pin_source,
         "path": [{"id": item["id"], "name": item["name"]} for item in path_rows],
         "path_label": " › ".join(item["name"] for item in path_rows),
         "direct_memory_count": direct_memory_count,

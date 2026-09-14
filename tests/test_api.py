@@ -573,10 +573,29 @@ class TestPlaces:
         assert kitchen_data["effective_lat"] == pytest.approx(52.23)
         assert kitchen_data["effective_lon"] == pytest.approx(21.01)
         assert kitchen_data["pin_inherited"] is True
+        assert kitchen_data["pin_source"] == "inherited"
 
         places = client.get("/places").json()
         assert [place["path_label"] for place in places] == ["Home", "Home › Kitchen"]
         assert places[0]["child_count"] == 1
+        assert places[0]["pin_source"] == "own"
+
+    def test_place_uses_assigned_memory_gps_when_it_has_no_saved_pin(self, client):
+        cafe_id = client.post("/places", json={"name": "Old Cafe"}).json()["id"]
+        memory_id = client.post(
+            "/memory",
+            files={"photo": ("cafe.jpg", _tiny_jpeg(), "image/jpeg")},
+            data={"place_id": str(cafe_id), "lat": "45.815", "lon": "15.982"},
+        ).json()["memory_id"]
+
+        cafe = client.get(f"/places/{cafe_id}").json()
+
+        assert cafe["lat"] is None
+        assert cafe["effective_lat"] == pytest.approx(45.815)
+        assert cafe["effective_lon"] == pytest.approx(15.982)
+        assert cafe["pin_source"] == "memory"
+        assert cafe["pin_inherited"] is False
+        assert cafe["preview_memory_ids"] == [memory_id]
 
     def test_rejects_missing_parent_and_duplicate_sibling_name(self, client):
         missing = client.post("/places", json={"name": "Bedroom", "parent_id": 999})
